@@ -1,0 +1,6 @@
+# settings backups created by install/uninstall
+*.codex-fusion.bak
+
+# OS cruft
+.DS_Store
+Thumbs.db
