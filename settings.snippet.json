@@ -6,7 +6,7 @@
           {
             "type": "command",
             "command": "$HOME/.claude/hooks/codex-fusion-userprompt.sh",
-            "timeout": 120
+            "timeout": 170
           }
         ]
       }
@@ -17,7 +17,7 @@
           {
             "type": "command",
             "command": "$HOME/.claude/hooks/codex-fusion-stop.sh",
-            "timeout": 120
+            "timeout": 170
           }
         ]
       }

@@ -86,12 +86,19 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | Knob | Default | Effect |
 |---|---|---|
 | `[no-codex]` in your prompt | — | Skips Codex entirely for that prompt. |
-| `CODEX_FUSION_EFFORT` | `medium` | Codex reasoning effort (`low` / `medium` / `high`). Lower = faster/cheaper. |
+| `CODEX_FUSION_MODEL` | `gpt-5.5` | Codex model to use. Defaults to the strongest available model. |
+| `CODEX_FUSION_EFFORT` | `high` | Codex reasoning effort (`low` / `medium` / `high` / `xhigh`). |
 | `CODEX_FUSION_DEBUG=1` | off | Logs gate decisions to `${TMPDIR:-/tmp}/codex-fusion-state/debug.log`. |
 
-> **Why `medium`?** Codex's own config default may be `xhigh`, which can take well over a hook's
-> timeout for a single analysis. Codex Fusion forces a faster effort per invocation so prompts
-> aren't held up. Raise it with `CODEX_FUSION_EFFORT=high` if you want deeper analysis.
+> **Strongest model, high effort.** Codex Fusion runs on the best Codex model at `high` reasoning
+> effort by default, so the second opinion is as strong as possible. The model is pinned in one
+> constant at the top of each hook (`CODEX_MODEL`) and overridable via `CODEX_FUSION_MODEL` — bump
+> it when a newer top model ships. If the pinned model isn't available to your account, the hook
+> automatically retries once with Codex's own default model so you still get an analysis.
+>
+> This costs latency: a complex prompt waits for Codex (typically ~60–90s) before Claude responds,
+> so the internal timeout is 150s (hook registration timeout 170s). To trade quality for speed, set
+> `CODEX_FUSION_EFFORT=medium` (or `low`), or use `[no-codex]` to skip a given prompt.
 
 ### The trigger gate
 

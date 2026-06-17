@@ -23,10 +23,11 @@ fi
 _cx_dir="$(dirname "$("$PY" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CODEX_BIN" 2>/dev/null || echo "$CODEX_BIN")")"
 case ":$PATH:" in *":$_cx_dir:"*) ;; *) export PATH="$_cx_dir:$PATH";; esac
 
-CODEX_TIMEOUT=100
+CODEX_TIMEOUT=150
 MAX_CHARS=12000
-# Codex's own config default may be xhigh (too slow for a hook); force a fast effort.
-CODEX_REASONING="${CODEX_FUSION_EFFORT:-medium}"
+# Codex Fusion runs on the strongest Codex model at high reasoning effort (override via env).
+CODEX_MODEL="${CODEX_FUSION_MODEL:-gpt-5.5}"      # highest Codex model; bump when a newer top model ships
+CODEX_REASONING="${CODEX_FUSION_EFFORT:-high}"
 
 INPUT="$(cat)"; [ -n "$INPUT" ] || exit 0
 # Parse prompt/cwd/session_id in one python call; base64 so newlines survive the shell.
@@ -101,15 +102,22 @@ EOF
 
 LASTMSG="$(mktemp 2>/dev/null)" || exit 0
 trap 'rm -f "$LASTMSG"' EXIT
-dbg "running codex (cwd=$CWD, words=$WORDS)"
-timeout "$CODEX_TIMEOUT" "$CODEX_BIN" -c model_reasoning_effort="$CODEX_REASONING" --ask-for-approval never exec \
-  -C "$CWD" \
-  --sandbox read-only \
-  --color never \
-  --skip-git-repo-check \
-  -o "$LASTMSG" \
-  "$CODEX_PROMPT" </dev/null >/dev/null 2>&1
-RC=$?
+
+# Run Codex read-only on the strongest model at high effort. If the pinned model is
+# unavailable, fall back once to Codex's own default model so analysis still happens.
+MODEL_ARGS=(); [ -n "$CODEX_MODEL" ] && MODEL_ARGS=(-m "$CODEX_MODEL")
+run_codex() {
+  timeout "$CODEX_TIMEOUT" "$CODEX_BIN" "${MODEL_ARGS[@]}" -c model_reasoning_effort="$CODEX_REASONING" \
+    --ask-for-approval never exec \
+    -C "$CWD" --sandbox read-only --color never --skip-git-repo-check \
+    -o "$LASTMSG" "$CODEX_PROMPT" </dev/null >/dev/null 2>&1
+}
+dbg "running codex (model=${CODEX_MODEL:-default}, effort=$CODEX_REASONING, cwd=$CWD, words=$WORDS)"
+run_codex; RC=$?
+if [ "$RC" -ne 0 ] && [ "${#MODEL_ARGS[@]}" -gt 0 ]; then
+  dbg "model $CODEX_MODEL failed (rc=$RC); retrying with codex default model"
+  MODEL_ARGS=(); : >"$LASTMSG"; run_codex; RC=$?
+fi
 [ "$RC" -eq 0 ] || { dbg "codex rc=$RC -> skip"; exit 0; }
 ANALYSIS="$(cat "$LASTMSG" 2>/dev/null)"
 [ -n "$ANALYSIS" ] || { dbg "empty analysis -> skip"; exit 0; }
