@@ -48,13 +48,20 @@ if not isinstance(data, dict):
 
 hooks = data.setdefault("hooks", {})
 
+# Hook registration timeout. Keep in sync with settings.snippet.json and comfortably above the
+# hooks' internal CODEX_TIMEOUT (240s) so xhigh Codex calls finish instead of being killed.
+HOOK_TIMEOUT = 270
+
 def ensure(event, command):
     arr = hooks.setdefault(event, [])
     for grp in arr:
         for h in grp.get("hooks", []):
             if h.get("command") == command:
+                # Already present: converge its config to the current value on re-run/upgrade.
+                h["type"] = "command"
+                h["timeout"] = HOOK_TIMEOUT
                 return False
-    arr.append({"hooks": [{"type": "command", "command": command, "timeout": 120}]})
+    arr.append({"hooks": [{"type": "command", "command": command, "timeout": HOOK_TIMEOUT}]})
     return True
 
 added_ups = ensure("UserPromptSubmit", ups)

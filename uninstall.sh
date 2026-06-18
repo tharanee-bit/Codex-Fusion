@@ -11,10 +11,14 @@ PY="$(command -v python3 || true)"
 
 if [ -f "$SETTINGS" ]; then
   CF_SETTINGS="$SETTINGS" "$PY" - <<'PY'
-import json, os, shutil
+import json, os, shutil, sys
 s = os.environ["CF_SETTINGS"]
-with open(s) as f:
-    d = json.load(f)
+try:
+    with open(s) as f:
+        d = json.load(f)
+except Exception as e:
+    print(f"WARNING: {s} is not valid JSON ({e}); leaving it untouched.", file=sys.stderr)
+    sys.exit(0)
 shutil.copy2(s, s + ".codex-fusion.bak")
 hooks = d.get("hooks", {})
 

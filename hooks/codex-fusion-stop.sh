@@ -7,7 +7,7 @@ set +e
 export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 STATE_DIR="${TMPDIR:-/tmp}/codex-fusion-state"
-dbg(){ [ "${CODEX_FUSION_DEBUG:-0}" = "1" ] && { mkdir -p "$STATE_DIR" 2>/dev/null; printf '%s STOP: %s\n' "$$" "$*" >>"$STATE_DIR/debug.log"; }; }
+dbg(){ [ "${CODEX_FUSION_DEBUG:-0}" = "1" ] && { mkdir -p -m 700 "$STATE_DIR" 2>/dev/null; printf '%s STOP: %s\n' "$$" "$*" >>"$STATE_DIR/debug.log"; }; }
 
 PY="/usr/bin/python3"; [ -x "$PY" ] || PY="$(command -v python3 2>/dev/null)"; [ -x "$PY" ] || exit 0
 CODEX_BIN="$(command -v codex 2>/dev/null)"
@@ -38,6 +38,8 @@ for k in ("cwd","session_id","stop_hook_active"):
 CWD="$(printf '%s' "$FIELDS" | sed -n 1p | base64 -d 2>/dev/null)"
 SESSION_ID="$(printf '%s' "$FIELDS" | sed -n 2p | base64 -d 2>/dev/null)"
 STOP_ACTIVE="$(printf '%s' "$FIELDS" | sed -n 3p | base64 -d 2>/dev/null)"
+# Sanitize session_id before it becomes a filename under STATE_DIR (no path traversal / odd chars).
+case "$SESSION_ID" in *[!A-Za-z0-9._-]*|.|..) SESSION_ID="";; esac
 
 # loop guard: we're already inside a continuation we forced -> don't review again
 [ "$STOP_ACTIVE" = "true" ] && { dbg "stop_hook_active -> exit"; exit 0; }
@@ -49,7 +51,9 @@ MARKER="$STATE_DIR/$SESSION_ID.complex"
 DIFF="$(git -C "$CWD" diff HEAD 2>/dev/null | head -c "$MAX_DIFF")"
 [ -n "$DIFF" ] || { dbg "empty diff -> exit"; rm -f "$MARKER" 2>/dev/null; exit 0; }
 CHANGED="$(git -C "$CWD" status --short 2>/dev/null | head -c 3000)"
-rm -f "$MARKER" 2>/dev/null   # review at most once per complex task
+# NOTE: the marker is deleted only on a DEFINITIVE outcome (PASS, or a delivered ISSUES_FOUND block),
+# not here. A transient failure (codex error/timeout) leaves it so the next genuine Stop retries the
+# review instead of silently losing it.
 
 CODEX_PROMPT="$(cat <<EOF
 You are Codex acting as an independent code reviewer for Claude Code.
@@ -94,15 +98,24 @@ run_codex() {
 }
 dbg "running codex review (model=${CODEX_MODEL:-default}, effort=$CODEX_REASONING)"
 run_codex; RC=$?
-if [ "$RC" -ne 0 ] && [ "${#MODEL_ARGS[@]}" -gt 0 ]; then
+# Fall back to the default model only on a FAST failure (e.g. model id unavailable). After an
+# internal timeout (rc 124) there's no budget left for a second run, so don't bother.
+if [ "$RC" -ne 0 ] && [ "$RC" -ne 124 ] && [ "${#MODEL_ARGS[@]}" -gt 0 ]; then
   dbg "model $CODEX_MODEL failed (rc=$RC); retrying with codex default model"
   MODEL_ARGS=(); : >"$LASTMSG"; run_codex; RC=$?
 fi
-[ "$RC" -eq 0 ] || { dbg "codex rc!=0 -> exit"; exit 0; }
-REVIEW="$(cat "$LASTMSG" 2>/dev/null)"; [ -n "$REVIEW" ] || exit 0
+# On a transient failure, KEEP the marker so the next genuine Stop retries the review.
+[ "$RC" -eq 0 ] || { dbg "codex rc!=0 -> exit (marker kept for retry)"; exit 0; }
+REVIEW="$(cat "$LASTMSG" 2>/dev/null)"; [ -n "$REVIEW" ] || { dbg "empty review -> exit (marker kept)"; exit 0; }
 
-# Only block when Codex explicitly flags issues; otherwise let Claude finish.
-if ! printf '%s' "$REVIEW" | grep -qiE 'CODEX_REVIEW_VERDICT:[[:space:]]*ISSUES_FOUND'; then
+# Codex responded: this is a definitive review, so consume the marker (review once).
+rm -f "$MARKER" 2>/dev/null
+
+# Only block when Codex explicitly flags issues. Per the prompt contract the verdict is the FIRST
+# line, so check only the first non-empty line — this also stops injected diff/prompt content from
+# forging the control token deeper in the response.
+VERDICT_LINE="$(printf '%s' "$REVIEW" | grep -m1 -vE '^[[:space:]]*$')"
+if ! printf '%s' "$VERDICT_LINE" | grep -qiE 'CODEX_REVIEW_VERDICT:[[:space:]]*ISSUES_FOUND'; then
   dbg "verdict PASS/none -> exit"; exit 0
 fi
 
