@@ -87,18 +87,20 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 |---|---|---|
 | `[no-codex]` in your prompt | — | Skips Codex entirely for that prompt. |
 | `CODEX_FUSION_MODEL` | `gpt-5.5` | Codex model to use. Defaults to the strongest available model. |
-| `CODEX_FUSION_EFFORT` | `high` | Codex reasoning effort (`low` / `medium` / `high` / `xhigh`). |
+| `CODEX_FUSION_EFFORT` | `xhigh` | Codex reasoning effort (`low` / `medium` / `high` / `xhigh`). Defaults to extra-high. |
 | `CODEX_FUSION_DEBUG=1` | off | Logs gate decisions to `${TMPDIR:-/tmp}/codex-fusion-state/debug.log`. |
 
-> **Strongest model, high effort.** Codex Fusion runs on the best Codex model at `high` reasoning
-> effort by default, so the second opinion is as strong as possible. The model is pinned in one
-> constant at the top of each hook (`CODEX_MODEL`) and overridable via `CODEX_FUSION_MODEL` — bump
-> it when a newer top model ships. If the pinned model isn't available to your account, the hook
-> automatically retries once with Codex's own default model so you still get an analysis.
+> **Strongest model, extra-high effort.** Codex Fusion runs on the best Codex model at `xhigh`
+> (extra-high) reasoning effort by default, so the second opinion is as strong as possible. The model
+> is pinned in one constant at the top of each hook (`CODEX_MODEL`) and overridable via
+> `CODEX_FUSION_MODEL` — bump it when a newer top model ships. If the pinned model isn't available to
+> your account, the hook automatically retries once with Codex's own default model so you still get an
+> analysis.
 >
-> This costs latency: a complex prompt waits for Codex (typically ~60–90s) before Claude responds,
-> so the internal timeout is 150s (hook registration timeout 170s). To trade quality for speed, set
-> `CODEX_FUSION_EFFORT=medium` (or `low`), or use `[no-codex]` to skip a given prompt.
+> This costs latency: a complex prompt waits for Codex (typically ~70–180s, longer on big repos or
+> diffs) before Claude responds, so the internal timeout is 240s (hook registration timeout 270s) to
+> give `xhigh` room to finish rather than being killed. To trade quality for speed, set
+> `CODEX_FUSION_EFFORT=high` (or `medium` / `low`), or use `[no-codex]` to skip a given prompt.
 
 ### The trigger gate
 
@@ -118,7 +120,7 @@ in `hooks/codex-fusion-userprompt.sh`.
 - The `Stop` hook only ever forces Claude to continue (`decision: block`) when Codex explicitly
   returns `CODEX_REVIEW_VERDICT: ISSUES_FOUND`, and it is loop-safe via `stop_hook_active` — it
   reviews at most once per task.
-- Internal `timeout` (100s) keeps each Codex call bounded; injected output is truncated.
+- Internal `timeout` (240s) keeps each Codex call bounded; injected output is truncated.
 
 ## Test it
 

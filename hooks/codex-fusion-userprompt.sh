@@ -23,11 +23,11 @@ fi
 _cx_dir="$(dirname "$("$PY" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CODEX_BIN" 2>/dev/null || echo "$CODEX_BIN")")"
 case ":$PATH:" in *":$_cx_dir:"*) ;; *) export PATH="$_cx_dir:$PATH";; esac
 
-CODEX_TIMEOUT=150
+CODEX_TIMEOUT=240   # xhigh effort needs more headroom than high; killed calls skip silently
 MAX_CHARS=12000
-# Codex Fusion runs on the strongest Codex model at high reasoning effort (override via env).
+# Codex Fusion runs on the strongest Codex model at extra-high (xhigh) reasoning effort (override via env).
 CODEX_MODEL="${CODEX_FUSION_MODEL:-gpt-5.5}"      # highest Codex model; bump when a newer top model ships
-CODEX_REASONING="${CODEX_FUSION_EFFORT:-high}"
+CODEX_REASONING="${CODEX_FUSION_EFFORT:-xhigh}"  # extra-high effort; xhigh is slower (see CODEX_TIMEOUT)
 
 INPUT="$(cat)"; [ -n "$INPUT" ] || exit 0
 # Parse prompt/cwd/session_id in one python call; base64 so newlines survive the shell.
@@ -103,8 +103,8 @@ EOF
 LASTMSG="$(mktemp 2>/dev/null)" || exit 0
 trap 'rm -f "$LASTMSG"' EXIT
 
-# Run Codex read-only on the strongest model at high effort. If the pinned model is
-# unavailable, fall back once to Codex's own default model so analysis still happens.
+# Run Codex read-only on the strongest model at xhigh (extra-high) effort. If the pinned
+# model is unavailable, fall back once to Codex's own default model so analysis still happens.
 MODEL_ARGS=(); [ -n "$CODEX_MODEL" ] && MODEL_ARGS=(-m "$CODEX_MODEL")
 run_codex() {
   timeout "$CODEX_TIMEOUT" "$CODEX_BIN" "${MODEL_ARGS[@]}" -c model_reasoning_effort="$CODEX_REASONING" \
