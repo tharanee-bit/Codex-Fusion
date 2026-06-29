@@ -1,6 +1,6 @@
 ---
 name: codex-fusion-auto
-description: Automatically synthesize Claude's coding plan with independent Codex analysis when Codex Fusion hook context is present. Use for complex coding tasks, architecture, debugging, refactors, migrations, security-sensitive changes, API design, and substantial code review.
+description: Automatically synthesize Claude's coding plan with independent Codex analysis when Codex Fusion hook context is present. Use whenever Codex Fusion injects context, including coding tasks, architecture, debugging, refactors, migrations, security-sensitive changes, API design, and substantial code review.
 user-invocable: false
 ---
 

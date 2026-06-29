@@ -3,16 +3,17 @@
 **Automatic peer review for Claude Code, powered by your local Codex CLI.**
 
 Codex Fusion makes [Claude Code](https://claude.com/claude-code) automatically consult
-[OpenAI Codex CLI](https://github.com/openai/codex) as an independent second opinion on
-non-trivial coding tasks — *without* a slash command, and *without* you typing anything.
+[OpenAI Codex CLI](https://github.com/openai/codex) as an independent second opinion on nearly
+every non-empty prompt — *without* a slash command, and *without* you typing anything.
 It uses Claude Code **hooks**:
 
 - **Before** Claude plans or edits, a `UserPromptSubmit` hook runs Codex **read-only** over your
   repo and injects Codex's independent analysis into Claude's context. Claude then reconciles its
   own plan with Codex's (consensus / disagreements / Codex-only insights) before touching code.
-- **After** Claude finishes a complex, file-changing task, a `Stop` hook runs Codex **read-only**
-  over the resulting `git diff`. If Codex flags serious problems (correctness, security, data-loss,
-  concurrency, broken tests), Claude is asked to address them before finalizing.
+- **After** Claude finishes with changes since the prompt-start baseline, a `Stop` hook runs Codex
+  **read-only** over the incremental tracked/untracked review surface. If Codex flags serious
+  problems (correctness, security, data-loss, concurrency, broken tests), Claude is asked to address
+  them before finalizing.
 
 Claude stays the editor and the final judge. Codex only advises and reviews — it is always
 **read-only** and never edits your files.
@@ -28,8 +29,8 @@ Claude stays the editor and the final judge. Codex only advises and reviews — 
 ```
                     ┌─────────────────────────── you type a prompt
                     ▼
-   UserPromptSubmit hook ── gate? ──no──▶ (silent, Claude proceeds normally)
-        │ yes (non-trivial)
+   UserPromptSubmit hook ── pure ack / [no-codex] / nested? ──yes──▶ (silent)
+        │ no
         ▼
    codex exec --sandbox read-only   ──▶  analysis injected as additionalContext
         │
@@ -37,7 +38,7 @@ Claude stays the editor and the final judge. Codex only advises and reviews — 
    Claude synthesizes Claude + Codex, then edits
         │
         ▼
-   Stop hook ── task was complex AND git diff non-empty? ──no──▶ (Claude finishes)
+   Stop hook ── changes since prompt baseline? ──no──▶ (Claude finishes)
         │ yes
         ▼
    codex exec --sandbox read-only over the diff
@@ -46,9 +47,10 @@ Claude stays the editor and the final judge. Codex only advises and reviews — 
         └─ verdict ISSUES_FOUND ──▶ Claude must address them first (blocks once)
 ```
 
-The two hooks coordinate through a small per-session marker file in
-`${TMPDIR:-/tmp}/codex-fusion-state/`, so the Stop review only fires for tasks the
-UserPromptSubmit gate already judged complex.
+The UserPromptSubmit hook records a prompt-start review-surface baseline in
+`${TMPDIR:-/tmp}/codex-fusion-state/`. The Stop hook compares that baseline to the current
+tracked/untracked review surface, so pre-existing dirty work does not trigger an unrelated review,
+while an unchanged already-reviewed surface does not get reviewed again on every later Stop.
 
 ## Requirements
 
@@ -97,18 +99,18 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 > your account, the hook automatically retries once with Codex's own default model so you still get an
 > analysis.
 >
-> This costs latency: a complex prompt waits for Codex (typically ~70–180s, longer on big repos or
+> This costs latency: most prompts now wait for Codex (typically ~70–180s, longer on big repos or
 > diffs) before Claude responds, so the internal timeout is 240s (hook registration timeout 270s) to
-> give `xhigh` room to finish rather than being killed. To trade quality for speed, set
+> give `xhigh` room to finish rather than being killed. Broader firing also means more prompt and
+> diff text is sent through your logged-in Codex CLI. To trade quality for speed, set
 > `CODEX_FUSION_EFFORT=high` (or `medium` / `low`), or use `[no-codex]` to skip a given prompt.
 
 ### The trigger gate
 
-The `UserPromptSubmit` hook uses an **aggressive** gate: it consults Codex on most substantive
-prompts and only skips when a prompt is clearly trivial or conversational — `[no-codex]`, ≤2 words,
-a typo/rename/format/lint/comment edit, a greeting, or a short pure question with no coding verb.
-To make it *conservative* instead (only fire on clear complex-coding keywords), edit the gate block
-in `hooks/codex-fusion-userprompt.sh`.
+The `UserPromptSubmit` hook uses a **near-universal** gate: it consults Codex on every non-empty
+prompt except explicit `[no-codex]`, pure acknowledgements/greetings like `ok` or `thanks`, nested
+Fusion subprocesses, or missing/failed dependencies. Typos, renames, formatting requests, comments,
+short questions, and two-word prompts all trigger Codex.
 
 ## Safety model
 
@@ -118,8 +120,8 @@ in `hooks/codex-fusion-userprompt.sh`.
 - Both hooks **never block** Claude on the no-action path — they always exit 0. If Codex is missing,
   not logged in, times out, or errors, the hook silently skips.
 - The `Stop` hook only ever forces Claude to continue (`decision: block`) when Codex explicitly
-  returns `CODEX_REVIEW_VERDICT: ISSUES_FOUND`, and it is loop-safe via `stop_hook_active` — it
-  reviews at most once per task.
+  returns `CODEX_REVIEW_VERDICT: ISSUES_FOUND`, and it is loop-safe via `stop_hook_active` plus a
+  prompt baseline and reviewed-diff hash.
 - Internal `timeout` (240s) keeps each Codex call bounded; injected output is truncated.
 
 ## Test it
@@ -127,7 +129,9 @@ in `hooks/codex-fusion-userprompt.sh`.
 ```bash
 # Triggers Codex (you'll see "AUTOMATIC CODEX FUSION CONTEXT" injected):
 #   Refactor the auth middleware to eliminate the token-refresh race condition.
-# Skips (trivial):           Fix the typo in the README heading.
+#   Fix the typo in the README heading.
+#   what does this function do?
+# Skips (pure ack):          thanks!
 # Skips (escape hatch):      Refactor the payment retry logic [no-codex]
 ```
 
