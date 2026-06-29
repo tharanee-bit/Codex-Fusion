@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # codex-fusion-stop.sh  (Claude Code Stop hook)
-# When the finished task was gated-complex (marker from the UserPromptSubmit hook) AND there are
-# working-tree changes, run Codex READ-ONLY over `git diff HEAD`. If Codex returns ISSUES_FOUND,
-# block ONCE (decision:block) with the review so Claude addresses it. Loop-safe; never errors out.
+# When the working tree changed since this turn's prompt-start baseline, run Codex READ-ONLY over
+# the incremental review surface. If Codex returns ISSUES_FOUND, block ONCE (decision:block) with
+# the review so Claude addresses it. Loop-safe; never errors out.
 set +e
 export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 STATE_DIR="${TMPDIR:-/tmp}/codex-fusion-state"
 dbg(){ [ "${CODEX_FUSION_DEBUG:-0}" = "1" ] && { mkdir -p -m 700 "$STATE_DIR" 2>/dev/null; printf '%s STOP: %s\n' "$$" "$*" >>"$STATE_DIR/debug.log"; }; }
+
+if [ "${CLAUDE_FUSION_ACTIVE:-0}" = "1" ] || [ "${CODEX_FUSION_ACTIVE:-0}" = "1" ]; then
+  dbg "skip: nested fusion active"
+  exit 0
+fi
 
 PY="/usr/bin/python3"; [ -x "$PY" ] || PY="$(command -v python3 2>/dev/null)"; [ -x "$PY" ] || exit 0
 CODEX_BIN="$(command -v codex 2>/dev/null)"
@@ -45,15 +50,51 @@ case "$SESSION_ID" in *[!A-Za-z0-9._-]*|.|..) SESSION_ID="";; esac
 [ "$STOP_ACTIVE" = "true" ] && { dbg "stop_hook_active -> exit"; exit 0; }
 [ -d "$CWD" ] || CWD="$PWD"
 
-MARKER="$STATE_DIR/$SESSION_ID.complex"
-[ -n "$SESSION_ID" ] && [ -f "$MARKER" ] || { dbg "no complex marker -> exit"; exit 0; }
+if [ -n "$SESSION_ID" ]; then
+  STATE_KEY="session-$SESSION_ID"
+else
+  # Blank session ids share cwd state; this avoids reviewing the same unchanged diff forever.
+  CWD_HASH="$(printf '%s' "$CWD" | git hash-object --stdin 2>/dev/null)"
+  STATE_KEY="cwd-${CWD_HASH:-unknown}"
+fi
+BASELINE_FILE="$STATE_DIR/$STATE_KEY.baseline"
+NO_REVIEW_FILE="$STATE_DIR/$STATE_KEY.no-review"
+REVIEWED_FILE="$STATE_DIR/$STATE_KEY.reviewed"
 
-DIFF="$(git -C "$CWD" diff HEAD 2>/dev/null | head -c "$MAX_DIFF")"
-[ -n "$DIFF" ] || { dbg "empty diff -> exit"; rm -f "$MARKER" 2>/dev/null; exit 0; }
+[ -f "$NO_REVIEW_FILE" ] && { dbg "no-review flag -> exit"; exit 0; }
+[ -f "$BASELINE_FILE" ] || { dbg "no prompt baseline -> exit"; exit 0; }
+
+CURRENT_FILE="$(mktemp 2>/dev/null)" || exit 0
+trap 'rm -f "$LASTMSG" "$CURRENT_FILE"' EXIT
+
+review_surface() {
+  git -C "$CWD" rev-parse --verify HEAD >/dev/null 2>&1 || return 1
+  printf '### tracked diff against HEAD\n'
+  git -C "$CWD" diff HEAD -- 2>/dev/null || return 1
+  printf '\n### untracked files\n'
+  git -C "$CWD" ls-files --others --exclude-standard -z 2>/dev/null |
+    while IFS= read -r -d '' f; do
+      printf '\n--- untracked file: %s ---\n' "$f"
+      git -C "$CWD" diff --no-index -- /dev/null "$CWD/$f" 2>/dev/null || true
+    done
+}
+
+review_surface >"$CURRENT_FILE" 2>/dev/null || { dbg "current review surface unavailable -> exit"; exit 0; }
+DIFF_HASH="$(git hash-object "$CURRENT_FILE" 2>/dev/null)"
+[ -n "$DIFF_HASH" ] || { dbg "empty diff hash -> exit"; exit 0; }
+BASELINE_HASH="$(git hash-object "$BASELINE_FILE" 2>/dev/null)"
+[ "$BASELINE_HASH" = "$DIFF_HASH" ] && { dbg "no changes since prompt baseline -> exit"; exit 0; }
+
+LAST_REVIEWED="$(cat "$REVIEWED_FILE" 2>/dev/null)"
+[ "$LAST_REVIEWED" = "$DIFF_HASH" ] && { dbg "diff already reviewed -> exit"; exit 0; }
+
+DIFF="$(diff -u --label prompt-baseline --label current "$BASELINE_FILE" "$CURRENT_FILE" 2>/dev/null | head -c "$MAX_DIFF")"
+[ -n "$DIFF" ] || { dbg "empty incremental diff -> exit"; exit 0; }
 CHANGED="$(git -C "$CWD" status --short 2>/dev/null | head -c 3000)"
-# NOTE: the marker is deleted only on a DEFINITIVE outcome (PASS, or a delivered ISSUES_FOUND block),
-# not here. A transient failure (codex error/timeout) leaves it so the next genuine Stop retries the
-# review instead of silently losing it.
+
+store_reviewed() {
+  mkdir -p -m 700 "$STATE_DIR" 2>/dev/null && printf '%s\n' "$DIFF_HASH" >"$REVIEWED_FILE" 2>/dev/null
+}
 
 CODEX_PROMPT="$(cat <<EOF
 You are Codex acting as an independent code reviewer for Claude Code.
@@ -61,9 +102,10 @@ You are running automatically from a Stop hook, in read-only mode.
 Do not edit files. Do not run destructive commands.
 Do not inspect credentials, tokens, .env files, keychains, shell history, or auth files.
 
-Review the git diff below for SERIOUS problems only: correctness bugs, security
-vulnerabilities, data-loss risks, concurrency/race issues, and broken or missing tests.
-Ignore pure style/formatting nits.
+Review only the incremental changes since the prompt-start baseline below for SERIOUS problems:
+correctness bugs, security vulnerabilities, data-loss risks, concurrency/race issues, and broken
+or missing tests. Ignore pure style/formatting nits and ignore issues that only appear in the
+prompt-baseline side.
 
 The VERY FIRST line of your response MUST be exactly one of:
 CODEX_REVIEW_VERDICT: PASS
@@ -79,19 +121,19 @@ $CWD
 Changed files:
 $CHANGED
 
-Diff:
+Incremental review surface:
 $DIFF
 EOF
 )"
 
 LASTMSG="$(mktemp 2>/dev/null)" || exit 0
-trap 'rm -f "$LASTMSG"' EXIT
 
 # Run Codex read-only on the strongest model at xhigh (extra-high) effort. If the pinned
 # model is unavailable, fall back once to Codex's own default model so the review still happens.
 MODEL_ARGS=(); [ -n "$CODEX_MODEL" ] && MODEL_ARGS=(-m "$CODEX_MODEL")
 run_codex() {
-  timeout "$CODEX_TIMEOUT" "$CODEX_BIN" "${MODEL_ARGS[@]}" -c model_reasoning_effort="$CODEX_REASONING" \
+  CLAUDE_FUSION_ACTIVE=1 CODEX_FUSION_ACTIVE=1 \
+    timeout "$CODEX_TIMEOUT" "$CODEX_BIN" "${MODEL_ARGS[@]}" -c model_reasoning_effort="$CODEX_REASONING" \
     --ask-for-approval never exec \
     -C "$CWD" --sandbox read-only --color never --skip-git-repo-check \
     -o "$LASTMSG" "$CODEX_PROMPT" </dev/null >/dev/null 2>&1
@@ -104,32 +146,35 @@ if [ "$RC" -ne 0 ] && [ "$RC" -ne 124 ] && [ "${#MODEL_ARGS[@]}" -gt 0 ]; then
   dbg "model $CODEX_MODEL failed (rc=$RC); retrying with codex default model"
   MODEL_ARGS=(); : >"$LASTMSG"; run_codex; RC=$?
 fi
-# On a transient failure, KEEP the marker so the next genuine Stop retries the review.
-[ "$RC" -eq 0 ] || { dbg "codex rc!=0 -> exit (marker kept for retry)"; exit 0; }
-REVIEW="$(cat "$LASTMSG" 2>/dev/null)"; [ -n "$REVIEW" ] || { dbg "empty review -> exit (marker kept)"; exit 0; }
-
-# Codex responded: this is a definitive review, so consume the marker (review once).
-rm -f "$MARKER" 2>/dev/null
+# On a transient failure, do not store the reviewed hash so the next genuine Stop retries.
+[ "$RC" -eq 0 ] || { dbg "codex rc!=0 -> exit (review hash not stored)"; exit 0; }
+REVIEW="$(cat "$LASTMSG" 2>/dev/null)"; [ -n "$REVIEW" ] || { dbg "empty review -> exit (review hash not stored)"; exit 0; }
 
 # Only block when Codex explicitly flags issues. Per the prompt contract the verdict is the FIRST
 # line, so check only the first non-empty line — this also stops injected diff/prompt content from
 # forging the control token deeper in the response.
 VERDICT_LINE="$(printf '%s' "$REVIEW" | grep -m1 -vE '^[[:space:]]*$')"
 if ! printf '%s' "$VERDICT_LINE" | grep -qiE 'CODEX_REVIEW_VERDICT:[[:space:]]*ISSUES_FOUND'; then
+  store_reviewed
   dbg "verdict PASS/none -> exit"; exit 0
 fi
 
-REVIEW="$REVIEW" MAX_CHARS="$MAX_CHARS" "$PY" <<'PY'
+BLOCK_JSON="$(REVIEW="$REVIEW" MAX_CHARS="$MAX_CHARS" "$PY" <<'PY'
 import os, json
 r = os.environ.get("REVIEW", "")
 try: m = int(os.environ.get("MAX_CHARS", "12000"))
 except Exception: m = 12000
 if len(r) > m: r = r[:m] + "\n\n[...truncated...]"
 reason = ("AUTOMATIC CODEX FUSION — POST-DIFF REVIEW:\n"
-          "Codex independently reviewed your git diff and flagged potential issues. Address the "
+          "Codex independently reviewed your incremental changes and flagged potential issues. Address the "
           "serious problems (correctness, security, data-loss, concurrency, broken tests) before "
           "finalizing, or explicitly justify why each is not a real issue. You remain the final judge.\n\n" + r)
 print(json.dumps({"decision": "block", "reason": reason}))
 PY
+)"
+EMIT_RC=$?
+[ "$EMIT_RC" -eq 0 ] && [ -n "$BLOCK_JSON" ] || { dbg "block json emit failed -> exit (review hash not stored)"; exit 0; }
+printf '%s\n' "$BLOCK_JSON" || { dbg "block json delivery failed -> exit (review hash not stored)"; exit 0; }
+store_reviewed
 dbg "blocked with ISSUES_FOUND"
 exit 0

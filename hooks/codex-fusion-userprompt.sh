@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # codex-fusion-userprompt.sh  (Claude Code UserPromptSubmit hook)
-# Auto-consult OpenAI Codex CLI (ChatGPT login, READ-ONLY) as an independent peer on
-# non-trivial coding prompts and inject its analysis into Claude's context.
+# Auto-consult OpenAI Codex CLI (ChatGPT login, READ-ONLY) as an independent peer on nearly every
+# non-empty prompt and inject its analysis into Claude's context.
 # GUARANTEE: never blocks Claude — always exits 0. Escape hatch: include [no-codex].
 set +e
 export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 STATE_DIR="${TMPDIR:-/tmp}/codex-fusion-state"
 dbg(){ [ "${CODEX_FUSION_DEBUG:-0}" = "1" ] && { mkdir -p -m 700 "$STATE_DIR" 2>/dev/null; printf '%s UPS: %s\n' "$$" "$*" >>"$STATE_DIR/debug.log"; }; }
+
+if [ "${CLAUDE_FUSION_ACTIVE:-0}" = "1" ] || [ "${CODEX_FUSION_ACTIVE:-0}" = "1" ]; then
+  dbg "skip: nested fusion active"
+  exit 0
+fi
 
 PY="/usr/bin/python3"; [ -x "$PY" ] || PY="$(command -v python3 2>/dev/null)"
 [ -x "$PY" ] || { dbg "no python3"; exit 0; }
@@ -41,56 +46,51 @@ for k in ("prompt","cwd","session_id"):
 PROMPT="$(printf '%s' "$FIELDS" | sed -n 1p | base64 -d 2>/dev/null)"
 CWD="$(printf '%s' "$FIELDS" | sed -n 2p | base64 -d 2>/dev/null)"
 SESSION_ID="$(printf '%s' "$FIELDS" | sed -n 3p | base64 -d 2>/dev/null)"
-# Sanitize session_id before it becomes a filename under STATE_DIR (defense-in-depth: no path
-# traversal / odd chars). Anything invalid blanks it, which disables the marker (handled below).
 case "$SESSION_ID" in *[!A-Za-z0-9._-]*|.|..) SESSION_ID="";; esac
 [ -n "$PROMPT" ] || exit 0
 [ -d "$CWD" ] || CWD="$PWD"
 
+state_key() {
+  if [ -n "$SESSION_ID" ]; then
+    printf 'session-%s' "$SESSION_ID"
+  else
+    CWD_HASH="$(printf '%s' "$CWD" | git hash-object --stdin 2>/dev/null)"
+    printf 'cwd-%s' "${CWD_HASH:-unknown}"
+  fi
+}
+
+review_surface() {
+  git -C "$CWD" rev-parse --verify HEAD >/dev/null 2>&1 || return 1
+  printf '### tracked diff against HEAD\n'
+  git -C "$CWD" diff HEAD -- 2>/dev/null || return 1
+  printf '\n### untracked files\n'
+  git -C "$CWD" ls-files --others --exclude-standard -z 2>/dev/null |
+    while IFS= read -r -d '' f; do
+      printf '\n--- untracked file: %s ---\n' "$f"
+      git -C "$CWD" diff --no-index -- /dev/null "$CWD/$f" 2>/dev/null || true
+    done
+}
+
+STATE_KEY="$(state_key)"
+BASELINE_FILE="$STATE_DIR/$STATE_KEY.baseline"
+NO_REVIEW_FILE="$STATE_DIR/$STATE_KEY.no-review"
+if mkdir -p -m 700 "$STATE_DIR" 2>/dev/null; then
+  rm -f "$NO_REVIEW_FILE" 2>/dev/null
+  if review_surface >"$BASELINE_FILE" 2>/dev/null; then
+    dbg "baselined review surface ($STATE_KEY)"
+  else
+    rm -f "$BASELINE_FILE" 2>/dev/null
+    dbg "baseline unavailable ($STATE_KEY)"
+  fi
+fi
+
 # --- escape hatch ---
-case "$PROMPT" in *"[no-codex]"*) dbg "skip: [no-codex]"; exit 0;; esac
+case "$PROMPT" in *"[no-codex]"*) : >"$NO_REVIEW_FILE" 2>/dev/null; dbg "skip: [no-codex]"; exit 0;; esac
 
-# --- AGGRESSIVE gate: trigger unless clearly trivial / conversational / tiny ---
-WORDS="$(printf '%s' "$PROMPT" | wc -w | tr -d ' ')"; WORDS="${WORDS:-0}"
-[ "$WORDS" -lt 3 ] 2>/dev/null && { dbg "skip: too short ($WORDS)"; exit 0; }
-FIRSTLINE="$(printf '%s' "$PROMPT" | sed -n '1p')"
-
-# Action verbs. ACTION_RE gates the question check; STRONG_ACTION_RE (the unambiguous subset) means
-# "real work" and overrides the trivial-edit heuristics below, so e.g. "implement a formatting
-# service" or "rename X and migrate Y" still trigger. Stems (migrat/optimi/integrat) use a prefix
-# match because \bmigrat\b cannot match "migrate".
-ACTION_RE='\b(implement|build|create|write|add|fix|debug|refactor|migrat|optimi[sz]|design|review|change|update|integrat|deploy|test|rewrite|redesign|secure|harden|delete|remove|configure|set ?up|wire|generate|scaffold|investigate|diagnose|profile)\b'
-STRONG_ACTION_RE='\b(implement|build|create|refactor|redesign|rewrite|architect|design|deploy|scaffold|generate|debug|diagnose|profile|investigate|secure|harden|wire)\b|\b(migrat|optimi[sz]|integrat)[a-z]*'
-HAS_STRONG=0
-printf '%s' "$PROMPT" | grep -iqE "$STRONG_ACTION_RE" && HAS_STRONG=1
-
-# 1) Whole-prompt conversational acknowledgement (the entire prompt is only ack words). -z anchors
-#    ^...$ to the whole (possibly multi-line) prompt, so an "ok" on line 1 cannot skip real work below.
+# Near-universal gate: run Codex for every non-empty prompt except pure acknowledgements/greetings.
+# -z anchors ^...$ to the whole prompt, so "ok, implement X" still triggers.
 ACK_RE='^[[:space:]]*((thanks|thank you|thx|ok|okay|cool|nice|great|got it|hi|hello|hey|yo|sup|yes|no|sure|nvm|never ?mind|lgtm)[[:punct:][:space:]]*)+$'
-printf '%s' "$PROMPT" | grep -ziqE "$ACK_RE" && { dbg "skip: conversational"; exit 0; }
-
-# 1b) Short message opening with an acknowledgement and no action verb (e.g. "thanks, that works").
-LEADING_ACK_RE='^[[:space:]]*(thanks|thank you|thx|ok|okay|cool|nice|great|got it|hi|hello|hey|yo|sup|yes|no|sure|nvm|never ?mind|lgtm)\b'
-if [ "$WORDS" -lt 6 ] && [ "$HAS_STRONG" -eq 0 ] && printf '%s' "$FIRSTLINE" | grep -iqE "$LEADING_ACK_RE" && ! printf '%s' "$PROMPT" | grep -iqE "$ACTION_RE"; then
-  dbg "skip: conversational"; exit 0
-fi
-
-# 2) Trivial micro-edits — only when no strong action verb is present, so substantive prompts that
-#    merely mention these nouns still trigger Codex.
-if [ "$HAS_STRONG" -eq 0 ]; then
-  TRIVIAL_RE='fix(ing)? (a |the )?typo|\btypo\b|\brewor[dk]|\bwording\b|formatting|reindent|indentation|whitespace|\blint(ing)?\b|prettier|one[- ]?liner|spelling|capitali[sz]'
-  printf '%s' "$PROMPT" | grep -iqE "$TRIVIAL_RE" && { dbg "skip: trivial"; exit 0; }
-  # comment edit, end-anchored to the whole prompt (so "add a comment moderation system" triggers)
-  printf '%s' "$PROMPT" | grep -ziqE '(add|fix|update|edit) (a |the )?comments?[[:space:]]*$' && { dbg "skip: trivial"; exit 0; }
-  # "rename"/"format" as the leading instruction (first line only, so a later line cannot trip it)
-  printf '%s' "$FIRSTLINE" | grep -iqE '^[[:space:]]*(rename|reformat|format)\b' && { dbg "skip: trivial"; exit 0; }
-fi
-
-# 3) Short, pure question with no coding-action verb -> skip. First line only (multi-line safe).
-QUESTION_RE='^[[:space:]]*(what|why|how|when|who|where|which|is|are|was|were|does|do|did|can|could|should|would|will|explain|describe|summari[sz]e|tell me|define|meaning of)\b'
-if [ "$WORDS" -lt 16 ] && printf '%s' "$FIRSTLINE" | grep -iqE "$QUESTION_RE" && ! printf '%s' "$PROMPT" | grep -iqE "$ACTION_RE"; then
-  dbg "skip: short question"; exit 0
-fi
+printf '%s' "$PROMPT" | grep -ziqE "$ACK_RE" && { : >"$NO_REVIEW_FILE" 2>/dev/null; dbg "skip: conversational"; exit 0; }
 # -> everything else TRIGGERS Codex
 
 GITSTATUS="$(git -C "$CWD" status --short 2>/dev/null | head -c 4000)"
@@ -139,12 +139,13 @@ trap 'rm -f "$LASTMSG"' EXIT
 # model is unavailable, fall back once to Codex's own default model so analysis still happens.
 MODEL_ARGS=(); [ -n "$CODEX_MODEL" ] && MODEL_ARGS=(-m "$CODEX_MODEL")
 run_codex() {
-  timeout "$CODEX_TIMEOUT" "$CODEX_BIN" "${MODEL_ARGS[@]}" -c model_reasoning_effort="$CODEX_REASONING" \
+  CLAUDE_FUSION_ACTIVE=1 CODEX_FUSION_ACTIVE=1 \
+    timeout "$CODEX_TIMEOUT" "$CODEX_BIN" "${MODEL_ARGS[@]}" -c model_reasoning_effort="$CODEX_REASONING" \
     --ask-for-approval never exec \
     -C "$CWD" --sandbox read-only --color never --skip-git-repo-check \
     -o "$LASTMSG" "$CODEX_PROMPT" </dev/null >/dev/null 2>&1
 }
-dbg "running codex (model=${CODEX_MODEL:-default}, effort=$CODEX_REASONING, cwd=$CWD, words=$WORDS)"
+dbg "running codex (model=${CODEX_MODEL:-default}, effort=$CODEX_REASONING, cwd=$CWD)"
 run_codex; RC=$?
 # Fall back to the default model only on a FAST failure (e.g. model id unavailable). After an
 # internal timeout (rc 124) there's no budget left for a second run, so don't bother.
@@ -156,11 +157,8 @@ fi
 ANALYSIS="$(cat "$LASTMSG" 2>/dev/null)"
 [ -n "$ANALYSIS" ] || { dbg "empty analysis -> skip"; exit 0; }
 
-# Mark this session's task complex so the Stop hook will review the diff.
-[ -n "$SESSION_ID" ] && { mkdir -p -m 700 "$STATE_DIR" 2>/dev/null; : >"$STATE_DIR/$SESSION_ID.complex" 2>/dev/null; }
-
 PREAMBLE="AUTOMATIC CODEX FUSION CONTEXT:
-Codex was automatically consulted because this prompt matched the complex-coding gate.
+Codex was automatically consulted for this turn as an independent peer.
 Claude: before editing, compare your own plan with Codex's analysis. Explicitly note consensus, disagreements, Codex-only insights, and your final decision. You are not required to follow Codex if you disagree."
 
 CODEX_ANALYSIS="$ANALYSIS" PREAMBLE="$PREAMBLE" MAX_CHARS="$MAX_CHARS" "$PY" <<'PY'
