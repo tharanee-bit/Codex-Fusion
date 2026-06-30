@@ -8,12 +8,13 @@ every non-empty prompt — *without* a slash command, and *without* you typing a
 It uses Claude Code **hooks**:
 
 - **Before** Claude plans or edits, a `UserPromptSubmit` hook runs Codex **read-only** over your
-  repo and injects Codex's independent analysis into Claude's context. Claude then reconciles its
-  own plan with Codex's (consensus / disagreements / Codex-only insights) before touching code.
+  repo and injects Codex's independent analysis into Claude's context. For broader or riskier
+  prompts, it can automatically fan out to bounded `planner`, `skeptic`, and `verifier` Codex
+  sub-agents before synthesizing their reports for Claude.
 - **After** Claude finishes with changes since the prompt-start baseline, a `Stop` hook runs Codex
-  **read-only** over the incremental tracked/untracked review surface. If Codex flags serious
-  problems (correctness, security, data-loss, concurrency, broken tests), Claude is asked to address
-  them before finalizing.
+  **read-only** over the incremental tracked/untracked review surface. Larger or high-risk diffs can
+  fan out to `correctness`, `security-data-loss-concurrency`, and `tests-regression` reviewers. If
+  any reviewer flags serious problems, Claude is asked to address them before finalizing.
 
 Claude stays the editor and the final judge. Codex only advises and reviews — it is always
 **read-only** and never edits your files.
@@ -32,7 +33,10 @@ Claude stays the editor and the final judge. Codex only advises and reviews — 
    UserPromptSubmit hook ── pure ack / [no-codex] / nested? ──yes──▶ (silent)
         │ no
         ▼
-   codex exec --sandbox read-only   ──▶  analysis injected as additionalContext
+   1 or more codex exec --sandbox read-only peers
+        │
+        ▼
+   synthesized analysis injected as additionalContext
         │
         ▼
    Claude synthesizes Claude + Codex, then edits
@@ -41,7 +45,7 @@ Claude stays the editor and the final judge. Codex only advises and reviews — 
    Stop hook ── changes since prompt baseline? ──no──▶ (Claude finishes)
         │ yes
         ▼
-   codex exec --sandbox read-only over the diff
+   1 or more codex exec --sandbox read-only reviewers over the diff
         │
         ├─ verdict PASS         ──▶ Claude finishes
         └─ verdict ISSUES_FOUND ──▶ Claude must address them first (blocks once)
@@ -51,6 +55,8 @@ The UserPromptSubmit hook records a prompt-start review-surface baseline in
 `${TMPDIR:-/tmp}/codex-fusion-state/`. The Stop hook compares that baseline to the current
 tracked/untracked review surface, so pre-existing dirty work does not trigger an unrelated review,
 while an unchanged already-reviewed surface does not get reviewed again on every later Stop.
+If a Stop review path fails transiently, the unchanged diff is retried a bounded number of times and
+then skipped until the diff changes.
 
 ## Requirements
 
@@ -88,8 +94,14 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | Knob | Default | Effect |
 |---|---|---|
 | `[no-codex]` in your prompt | — | Skips Codex entirely for that prompt. |
+| `[subagents]` or `[codex-subagents]` in your prompt | — | Forces bounded sub-agent fanout for that prompt and its Stop review. |
+| `[no-subagents]` in your prompt | — | Keeps that prompt and its Stop review on the single-Codex path. |
 | `CODEX_FUSION_MODEL` | `gpt-5.5` | Codex model to use. Defaults to the strongest available model. |
 | `CODEX_FUSION_EFFORT` | `xhigh` | Codex reasoning effort (`low` / `medium` / `high` / `xhigh`). Defaults to extra-high. |
+| `CODEX_FUSION_SUBAGENTS` | `auto` | Sub-agent policy: `auto`, `off`, or `always`. Prompt markers still select per-turn behavior. |
+| `CODEX_FUSION_MAX_AGENTS` | `4` | Hard cap for hook-launched Codex agents and any bounded internal delegation contract. |
+| `CODEX_FUSION_TIMEOUT` | `180` | Per-agent timeout in seconds. The Claude hook registration timeout remains 270s. |
+| `CODEX_FUSION_STOP_RETRY_LIMIT` | `2` | Number of transient failed Stop review attempts for an unchanged diff before skipping. |
 | `CODEX_FUSION_DEBUG=1` | off | Logs gate decisions to `${TMPDIR:-/tmp}/codex-fusion-state/debug.log`. |
 
 > **Strongest model, extra-high effort.** Codex Fusion runs on the best Codex model at `xhigh`
@@ -99,11 +111,12 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 > your account, the hook automatically retries once with Codex's own default model so you still get an
 > analysis.
 >
-> This costs latency: most prompts now wait for Codex (typically ~70–180s, longer on big repos or
-> diffs) before Claude responds, so the internal timeout is 240s (hook registration timeout 270s) to
-> give `xhigh` room to finish rather than being killed. Broader firing also means more prompt and
-> diff text is sent through your logged-in Codex CLI. To trade quality for speed, set
-> `CODEX_FUSION_EFFORT=high` (or `medium` / `low`), or use `[no-codex]` to skip a given prompt.
+> This costs latency: most prompts now wait for Codex before Claude responds. Fanout runs agents in
+> parallel, but it can still multiply Codex usage. The per-agent timeout is 180s (hook registration
+> timeout 270s), leaving room for parallel aggregation. Broader firing also means more prompt and diff
+> text is sent through your logged-in Codex CLI. To trade quality for speed, set
+> `CODEX_FUSION_SUBAGENTS=off`, set `CODEX_FUSION_EFFORT=high` (or `medium` / `low`), or use
+> `[no-codex]` / `[no-subagents]` for a given prompt.
 
 ### The trigger gate
 
@@ -112,17 +125,26 @@ prompt except explicit `[no-codex]`, pure acknowledgements/greetings like `ok` o
 Fusion subprocesses, or missing/failed dependencies. Typos, renames, formatting requests, comments,
 short questions, and two-word prompts all trigger Codex.
 
+Sub-agent fanout is automatic by default but bounded. Pre-prompt fanout runs when forced by marker,
+when `CODEX_FUSION_SUBAGENTS=always`, or when a simple score sees enough breadth/risk signals such
+as long prompts, multi-line plans, implementation/review/migration keywords, auth/security/database/
+concurrency terms, or a multi-file dirty tree. Stop fanout runs when forced, always-enabled, or when
+the incremental diff is large, spans at least three files, or touches high-risk areas such as auth,
+security, database/schema/migrations, concurrency, or tests.
+
 ## Safety model
 
 - Codex always runs `--ask-for-approval never --sandbox read-only` — it cannot edit files or run
   destructive commands. The prompt also explicitly tells Codex not to inspect credentials, `.env`,
   tokens, keychains, shell history, or auth files.
+- Hook-launched sub-agents are separate read-only `codex exec` subprocesses with separate output
+  files. Fanout roles do not recursively spawn nested agents; they return delegation requests instead.
 - Both hooks **never block** Claude on the no-action path — they always exit 0. If Codex is missing,
   not logged in, times out, or errors, the hook silently skips.
 - The `Stop` hook only ever forces Claude to continue (`decision: block`) when Codex explicitly
   returns `CODEX_REVIEW_VERDICT: ISSUES_FOUND`, and it is loop-safe via `stop_hook_active` plus a
-  prompt baseline and reviewed-diff hash.
-- Internal `timeout` (240s) keeps each Codex call bounded; injected output is truncated.
+  prompt baseline, reviewed-diff hash, and bounded failed-review retry counter.
+- Internal `timeout` keeps each Codex call bounded; injected output is truncated.
 
 ## Test it
 
@@ -131,6 +153,8 @@ short questions, and two-word prompts all trigger Codex.
 #   Refactor the auth middleware to eliminate the token-refresh race condition.
 #   Fix the typo in the README heading.
 #   what does this function do?
+# Forces fanout:              Refactor the auth middleware [subagents]
+# Forces single Codex:        Refactor the auth middleware [no-subagents]
 # Skips (pure ack):          thanks!
 # Skips (escape hatch):      Refactor the payment retry logic [no-codex]
 ```
@@ -154,6 +178,7 @@ deletes the installed hook scripts and skill. Your other hooks and settings are 
 ## Layout
 
 ```
+hooks/codex-fusion-common.sh       # shared Codex runner, fanout gates, and helpers
 hooks/codex-fusion-userprompt.sh   # UserPromptSubmit hook (pre-edit analysis)
 hooks/codex-fusion-stop.sh         # Stop hook (post-diff review)
 skills/codex-fusion-auto/SKILL.md  # how Claude synthesizes Claude + Codex

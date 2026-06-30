@@ -20,7 +20,8 @@ if ! command -v codex >/dev/null 2>&1; then
 fi
 
 mkdir -p "$HOOKS_DIR" "$SKILLS_DIR/codex-fusion-auto"
-install -m 0755 "$HERE/hooks/codex-fusion-userprompt.sh" "$HOOKS_DIR/codex-fusion-userprompt.sh"
+install -m 0644 "$HERE/hooks/codex-fusion-common.sh"      "$HOOKS_DIR/codex-fusion-common.sh"
+install -m 0755 "$HERE/hooks/codex-fusion-userprompt.sh"  "$HOOKS_DIR/codex-fusion-userprompt.sh"
 install -m 0755 "$HERE/hooks/codex-fusion-stop.sh"        "$HOOKS_DIR/codex-fusion-stop.sh"
 install -m 0644 "$HERE/skills/codex-fusion-auto/SKILL.md" "$SKILLS_DIR/codex-fusion-auto/SKILL.md"
 echo "Installed hooks + skill into $CLAUDE_DIR"
@@ -49,7 +50,7 @@ if not isinstance(data, dict):
 hooks = data.setdefault("hooks", {})
 
 # Hook registration timeout. Keep in sync with settings.snippet.json and comfortably above the
-# hooks' internal CODEX_TIMEOUT (240s) so xhigh Codex calls finish instead of being killed.
+# hooks' internal CODEX_TIMEOUT (180s by default) so xhigh Codex calls finish instead of being killed.
 HOOK_TIMEOUT = 270
 
 def ensure(event, command):

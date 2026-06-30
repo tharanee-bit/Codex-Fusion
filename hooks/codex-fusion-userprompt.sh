@@ -2,40 +2,28 @@
 # codex-fusion-userprompt.sh  (Claude Code UserPromptSubmit hook)
 # Auto-consult OpenAI Codex CLI (ChatGPT login, READ-ONLY) as an independent peer on nearly every
 # non-empty prompt and inject its analysis into Claude's context.
-# GUARANTEE: never blocks Claude — always exits 0. Escape hatch: include [no-codex].
+# GUARANTEE: never blocks Claude. Escape hatch: include [no-codex].
 set +e
-export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-STATE_DIR="${TMPDIR:-/tmp}/codex-fusion-state"
-dbg(){ [ "${CODEX_FUSION_DEBUG:-0}" = "1" ] && { mkdir -p -m 700 "$STATE_DIR" 2>/dev/null; printf '%s UPS: %s\n' "$$" "$*" >>"$STATE_DIR/debug.log"; }; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=hooks/codex-fusion-common.sh
+. "$SCRIPT_DIR/codex-fusion-common.sh" 2>/dev/null || exit 0
+cf_init_common "UPS"
 
-if [ "${CLAUDE_FUSION_ACTIVE:-0}" = "1" ] || [ "${CODEX_FUSION_ACTIVE:-0}" = "1" ]; then
-  dbg "skip: nested fusion active"
+if cf_nested_fusion_active; then
+  cf_dbg "skip: nested fusion active"
   exit 0
 fi
 
-PY="/usr/bin/python3"; [ -x "$PY" ] || PY="$(command -v python3 2>/dev/null)"
-[ -x "$PY" ] || { dbg "no python3"; exit 0; }
-# Resolve the codex binary, then put its real bin dir on PATH so codex's bundled
-# runtime (e.g. node) is reachable even in a minimal hook shell.
-CODEX_BIN="$(command -v codex 2>/dev/null)"
-if [ ! -x "$CODEX_BIN" ]; then
-  for c in "$HOME/.local/bin/codex" "$HOME/bin/codex" "/usr/local/bin/codex" "$HOME/.npm-global/bin/codex"; do
-    [ -x "$c" ] && { CODEX_BIN="$c"; break; }
-  done
-fi
-[ -x "$CODEX_BIN" ] || { dbg "no codex"; exit 0; }
-_cx_dir="$(dirname "$("$PY" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CODEX_BIN" 2>/dev/null || echo "$CODEX_BIN")")"
-case ":$PATH:" in *":$_cx_dir:"*) ;; *) export PATH="$_cx_dir:$PATH";; esac
+cf_setup_codex_runtime || exit 0
 
-CODEX_TIMEOUT=240   # xhigh effort needs more headroom than high; killed calls skip silently
 MAX_CHARS=12000
-# Codex Fusion runs on the strongest Codex model at extra-high (xhigh) reasoning effort (override via env).
-CODEX_MODEL="${CODEX_FUSION_MODEL:-gpt-5.5}"      # highest Codex model; bump when a newer top model ships
-CODEX_REASONING="${CODEX_FUSION_EFFORT:-xhigh}"  # extra-high effort; xhigh is slower (see CODEX_TIMEOUT)
+LASTMSG=""
+AGENT_DIR=""
+trap 'rm -f "$LASTMSG" 2>/dev/null; rm -rf "$AGENT_DIR" 2>/dev/null' EXIT
 
-INPUT="$(cat)"; [ -n "$INPUT" ] || exit 0
-# Parse prompt/cwd/session_id in one python call; base64 so newlines survive the shell.
+INPUT="$(cat)"
+[ -n "$INPUT" ] || exit 0
 FIELDS="$(printf '%s' "$INPUT" | "$PY" -c '
 import sys,json,base64
 try: d=json.load(sys.stdin)
@@ -74,31 +62,32 @@ review_surface() {
 STATE_KEY="$(state_key)"
 BASELINE_FILE="$STATE_DIR/$STATE_KEY.baseline"
 NO_REVIEW_FILE="$STATE_DIR/$STATE_KEY.no-review"
+SUBAGENTS_FILE="$STATE_DIR/$STATE_KEY.subagents"
 if mkdir -p -m 700 "$STATE_DIR" 2>/dev/null; then
   rm -f "$NO_REVIEW_FILE" 2>/dev/null
   if review_surface >"$BASELINE_FILE" 2>/dev/null; then
-    dbg "baselined review surface ($STATE_KEY)"
+    cf_dbg "baselined review surface ($STATE_KEY)"
   else
     rm -f "$BASELINE_FILE" 2>/dev/null
-    dbg "baseline unavailable ($STATE_KEY)"
+    cf_dbg "baseline unavailable ($STATE_KEY)"
   fi
 fi
 
-# --- escape hatch ---
-case "$PROMPT" in *"[no-codex]"*) : >"$NO_REVIEW_FILE" 2>/dev/null; dbg "skip: [no-codex]"; exit 0;; esac
+case "$PROMPT" in *"[no-codex]"*) : >"$NO_REVIEW_FILE" 2>/dev/null; rm -f "$SUBAGENTS_FILE" 2>/dev/null; cf_dbg "skip: [no-codex]"; exit 0;; esac
 
-# Near-universal gate: run Codex for every non-empty prompt except pure acknowledgements/greetings.
-# -z anchors ^...$ to the whole prompt, so "ok, implement X" still triggers.
 ACK_RE='^[[:space:]]*((thanks|thank you|thx|ok|okay|cool|nice|great|got it|hi|hello|hey|yo|sup|yes|no|sure|nvm|never ?mind|lgtm)[[:punct:][:space:]]*)+$'
-printf '%s' "$PROMPT" | grep -ziqE "$ACK_RE" && { : >"$NO_REVIEW_FILE" 2>/dev/null; dbg "skip: conversational"; exit 0; }
-# -> everything else TRIGGERS Codex
+printf '%s' "$PROMPT" | grep -ziqE "$ACK_RE" && { : >"$NO_REVIEW_FILE" 2>/dev/null; rm -f "$SUBAGENTS_FILE" 2>/dev/null; cf_dbg "skip: conversational"; exit 0; }
 
 GITSTATUS="$(git -C "$CWD" status --short 2>/dev/null | head -c 4000)"
 [ -n "$GITSTATUS" ] || GITSTATUS="(clean or not a git repository)"
 
-CODEX_PROMPT="$(cat <<EOF
-You are Codex acting as an independent coding peer for Claude Code.
+SUBAGENT_PREF="$(cf_prompt_subagent_preference "$PROMPT")"
+printf '%s\n' "$SUBAGENT_PREF" >"$SUBAGENTS_FILE" 2>/dev/null
+SHOULD_FANOUT="$(cf_userprompt_should_fanout "$PROMPT" "$GITSTATUS" "$SUBAGENT_PREF")"
+[ "$CODEX_MAX_AGENTS" -lt 2 ] && SHOULD_FANOUT=0
 
+userprompt_common_context() {
+  cat <<EOF
 You are running automatically from a Claude Code hook.
 You are in read-only mode.
 Do not edit files.
@@ -114,6 +103,20 @@ $CWD
 
 Quick repo state:
 $GITSTATUS
+EOF
+}
+
+single_prompt() {
+  cat <<EOF
+You are Codex acting as an independent coding peer for Claude Code.
+
+$(userprompt_common_context)
+
+Sub-agent policy:
+This hook selected single-agent mode. If your Codex runtime provides internal sub-agents, you may use
+bounded read-only delegation only when useful, with a total cap of $CODEX_MAX_AGENTS agents, max depth
+1, and the same model/reasoning policy. If the runtime cannot enforce that cap, analyze directly and
+optionally return a delegation request instead of spawning.
 
 Return a concise analysis with:
 1. Problem understanding
@@ -130,36 +133,141 @@ Keep the response under 1200 words.
 Do not produce a full patch unless asked.
 Prefer conservative, minimal changes.
 EOF
-)"
-
-LASTMSG="$(mktemp 2>/dev/null)" || exit 0
-trap 'rm -f "$LASTMSG"' EXIT
-
-# Run Codex read-only on the strongest model at xhigh (extra-high) effort. If the pinned
-# model is unavailable, fall back once to Codex's own default model so analysis still happens.
-MODEL_ARGS=(); [ -n "$CODEX_MODEL" ] && MODEL_ARGS=(-m "$CODEX_MODEL")
-run_codex() {
-  CLAUDE_FUSION_ACTIVE=1 CODEX_FUSION_ACTIVE=1 \
-    timeout "$CODEX_TIMEOUT" "$CODEX_BIN" "${MODEL_ARGS[@]}" -c model_reasoning_effort="$CODEX_REASONING" \
-    --ask-for-approval never exec \
-    -C "$CWD" --sandbox read-only --color never --skip-git-repo-check \
-    -o "$LASTMSG" "$CODEX_PROMPT" </dev/null >/dev/null 2>&1
 }
-dbg "running codex (model=${CODEX_MODEL:-default}, effort=$CODEX_REASONING, cwd=$CWD)"
-run_codex; RC=$?
-# Fall back to the default model only on a FAST failure (e.g. model id unavailable). After an
-# internal timeout (rc 124) there's no budget left for a second run, so don't bother.
-if [ "$RC" -ne 0 ] && [ "$RC" -ne 124 ] && [ "${#MODEL_ARGS[@]}" -gt 0 ]; then
-  dbg "model $CODEX_MODEL failed (rc=$RC); retrying with codex default model"
-  MODEL_ARGS=(); : >"$LASTMSG"; run_codex; RC=$?
-fi
-[ "$RC" -eq 0 ] || { dbg "codex rc=$RC -> skip"; exit 0; }
-ANALYSIS="$(cat "$LASTMSG" 2>/dev/null)"
-[ -n "$ANALYSIS" ] || { dbg "empty analysis -> skip"; exit 0; }
 
-PREAMBLE="AUTOMATIC CODEX FUSION CONTEXT:
+role_prompt() {
+  _role="$1"
+  _role_count="$2"
+  case "$_role" in
+    planner) _focus="Understand the task, propose the smallest implementation path, identify files/modules involved, and call out sequencing risks.";;
+    skeptic) _focus="Challenge the likely plan. Look for hidden correctness, security, data-loss, compatibility, latency, and scope risks.";;
+    verifier) _focus="Design the tests/checks and acceptance criteria that would catch regressions or incomplete implementation.";;
+    *) _focus="Analyze the task conservatively.";;
+  esac
+  cat <<EOF
+You are Codex acting as the $_role sub-agent for Claude Code.
+
+$(userprompt_common_context)
+
+Sub-agent fanout policy:
+The hook launched $_role_count read-only Codex agents out of a configured cap of $CODEX_MAX_AGENTS.
+Because parallel hook processes cannot coordinate nested runtime delegation, do not spawn internal
+sub-agents from this role. If more delegation would help, return a bounded delegation request.
+
+Role focus:
+$_focus
+
+Return under 700 words with:
+1. Role summary
+2. Evidence or repository signals used
+3. Recommendations or concerns
+4. Tests/checks Claude should run
+5. Assumptions and uncertainty
+
+Prefer evidence quality over consensus. Do not produce a full patch.
+EOF
+}
+
+run_single() {
+  LASTMSG="$(mktemp 2>/dev/null)" || return 1
+  _prompt="$(single_prompt)"
+  cf_run_codex_to_file "$LASTMSG" "$CWD" "$_prompt" "single"
+  _rc=$?
+  [ "$_rc" -eq 0 ] || { cf_dbg "codex single rc=$_rc -> skip"; return 1; }
+  _analysis="$(cat "$LASTMSG" 2>/dev/null)"
+  [ -n "$_analysis" ] || { cf_dbg "empty single analysis -> skip"; return 1; }
+  ANALYSIS="$_analysis"
+  FANOUT_USED=0
+  return 0
+}
+
+run_fanout() {
+  AGENT_DIR="$(mktemp -d 2>/dev/null)" || return 1
+  ROLES=(planner skeptic verifier)
+  SELECTED_ROLES=()
+  _limit="$CODEX_MAX_AGENTS"
+  [ "$_limit" -gt "${#ROLES[@]}" ] && _limit="${#ROLES[@]}"
+  [ "$_limit" -lt 2 ] && { cf_dbg "max agents $_limit too low for fanout; using single"; return 1; }
+  _idx=0
+  while [ "$_idx" -lt "$_limit" ]; do
+    SELECTED_ROLES+=("${ROLES[$_idx]}")
+    _idx=$((_idx + 1))
+  done
+  _role_count="${#SELECTED_ROLES[@]}"
+
+  PIDS=()
+  OUTFILES=()
+  STATUSFILES=()
+  for _role in "${SELECTED_ROLES[@]}"; do
+    _out="$AGENT_DIR/$_role.out"
+    _status="$AGENT_DIR/$_role.status"
+    OUTFILES+=("$_out")
+    STATUSFILES+=("$_status")
+    _prompt="$(role_prompt "$_role" "$_role_count")"
+    (
+      cf_run_codex_to_file "$_out" "$CWD" "$_prompt" "$_role"
+      printf '%s\n' "$?" >"$_status" 2>/dev/null
+    ) &
+    PIDS+=("$!")
+  done
+
+  for _pid in "${PIDS[@]}"; do
+    wait "$_pid"
+  done
+
+  _success=0
+  _failed=""
+  _body=""
+  _i=0
+  for _role in "${SELECTED_ROLES[@]}"; do
+    _rc="$(cat "${STATUSFILES[$_i]}" 2>/dev/null)"
+    _content="$(cat "${OUTFILES[$_i]}" 2>/dev/null)"
+    if [ "$_rc" = "0" ] && [ -n "$_content" ]; then
+      _success=$((_success + 1))
+      _body="${_body}
+## $_role
+$_content
+"
+    else
+      _failed="${_failed} $_role(rc=${_rc:-missing})"
+    fi
+    _i=$((_i + 1))
+  done
+
+  [ "$_success" -gt 0 ] || { cf_dbg "all fanout agents failed:$_failed"; return 2; }
+  if [ -n "$_failed" ]; then
+    _body="${_body}
+## Fanout Notes
+Failed agents:$_failed
+"
+  fi
+  ANALYSIS="Codex Fusion used bounded read-only sub-agent fanout ($_success/${#SELECTED_ROLES[@]} agents succeeded).
+$_body"
+  FANOUT_USED=1
+  return 0
+}
+
+ANALYSIS=""
+FANOUT_USED=0
+if [ "$SHOULD_FANOUT" = "1" ]; then
+  cf_dbg "fanout selected pref=$SUBAGENT_PREF max=$CODEX_MAX_AGENTS score=$(cf_userprompt_auto_score "$PROMPT" "$GITSTATUS")"
+  run_fanout
+  FANOUT_RC=$?
+  [ "$FANOUT_RC" -eq 0 ] || exit 0
+else
+  cf_dbg "single selected pref=$SUBAGENT_PREF max=$CODEX_MAX_AGENTS score=$(cf_userprompt_auto_score "$PROMPT" "$GITSTATUS")"
+  run_single || exit 0
+fi
+
+if [ "$FANOUT_USED" = "1" ]; then
+  PREAMBLE="AUTOMATIC CODEX FUSION CONTEXT:
+Codex was automatically consulted for this turn using bounded read-only sub-agent fanout.
+Claude: before editing, compare your own plan with the Codex agent reports. Explicitly note consensus, disagreements, Codex-only insights, and your final decision. Judge by evidence quality, not vote count. You are not required to follow Codex if you disagree."
+else
+  PREAMBLE="AUTOMATIC CODEX FUSION CONTEXT:
 Codex was automatically consulted for this turn as an independent peer.
 Claude: before editing, compare your own plan with Codex's analysis. Explicitly note consensus, disagreements, Codex-only insights, and your final decision. You are not required to follow Codex if you disagree."
+fi
 
 CODEX_ANALYSIS="$ANALYSIS" PREAMBLE="$PREAMBLE" MAX_CHARS="$MAX_CHARS" "$PY" <<'PY'
 import os, json
@@ -171,5 +279,5 @@ if len(a) > m: a = a[:m] + "\n\n[...Codex output truncated...]"
 ctx = p + "\n\n--- BEGIN CODEX ANALYSIS ---\n" + a + "\n--- END CODEX ANALYSIS ---"
 print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))
 PY
-dbg "injected $(printf '%s' "$ANALYSIS" | wc -c) chars"
+cf_dbg "injected $(printf '%s' "$ANALYSIS" | wc -c) chars fanout=$FANOUT_USED"
 exit 0
