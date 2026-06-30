@@ -178,6 +178,8 @@ run_single() {
   [ -n "$_analysis" ] || { cf_dbg "empty single analysis -> skip"; return 1; }
   ANALYSIS="$_analysis"
   FANOUT_USED=0
+  FANOUT_SPAWNED=0
+  FANOUT_SUCCEEDED=0
   return 0
 }
 
@@ -235,13 +237,15 @@ $_content
   done
 
   [ "$_success" -gt 0 ] || { cf_dbg "all fanout agents failed:$_failed"; return 2; }
+  FANOUT_SPAWNED="${#SELECTED_ROLES[@]}"
+  FANOUT_SUCCEEDED="$_success"
   if [ -n "$_failed" ]; then
     _body="${_body}
 ## Fanout Notes
 Failed agents:$_failed
 "
   fi
-  ANALYSIS="Codex Fusion used bounded read-only sub-agent fanout ($_success/${#SELECTED_ROLES[@]} agents succeeded).
+  ANALYSIS="Codex Fusion used bounded read-only sub-agent fanout (spawned $FANOUT_SPAWNED sub-agents; $FANOUT_SUCCEEDED/$FANOUT_SPAWNED succeeded).
 $_body"
   FANOUT_USED=1
   return 0
@@ -249,6 +253,8 @@ $_body"
 
 ANALYSIS=""
 FANOUT_USED=0
+FANOUT_SPAWNED=0
+FANOUT_SUCCEEDED=0
 if [ "$SHOULD_FANOUT" = "1" ]; then
   cf_dbg "fanout selected pref=$SUBAGENT_PREF max=$CODEX_MAX_AGENTS score=$(cf_userprompt_auto_score "$PROMPT" "$GITSTATUS")"
   run_fanout
@@ -261,7 +267,7 @@ fi
 
 if [ "$FANOUT_USED" = "1" ]; then
   PREAMBLE="AUTOMATIC CODEX FUSION CONTEXT:
-Codex was automatically consulted for this turn using bounded read-only sub-agent fanout.
+Codex was automatically consulted for this turn using bounded read-only sub-agent fanout (spawned $FANOUT_SPAWNED sub-agents; $FANOUT_SUCCEEDED/$FANOUT_SPAWNED succeeded).
 Claude: before editing, compare your own plan with the Codex agent reports. Explicitly note consensus, disagreements, Codex-only insights, and your final decision. Judge by evidence quality, not vote count. You are not required to follow Codex if you disagree."
 else
   PREAMBLE="AUTOMATIC CODEX FUSION CONTEXT:
@@ -269,15 +275,28 @@ Codex was automatically consulted for this turn as an independent peer.
 Claude: before editing, compare your own plan with Codex's analysis. Explicitly note consensus, disagreements, Codex-only insights, and your final decision. You are not required to follow Codex if you disagree."
 fi
 
-CODEX_ANALYSIS="$ANALYSIS" PREAMBLE="$PREAMBLE" MAX_CHARS="$MAX_CHARS" "$PY" <<'PY'
+SYSTEM_MESSAGE=""
+if cf_notify_enabled; then
+  if [ "$FANOUT_USED" = "1" ]; then
+    SYSTEM_MESSAGE="Codex Fusion: spawned $FANOUT_SPAWNED sub-agents; $FANOUT_SUCCEEDED/$FANOUT_SPAWNED succeeded."
+  else
+    SYSTEM_MESSAGE="Codex Fusion: Codex consulted successfully."
+  fi
+fi
+
+CODEX_ANALYSIS="$ANALYSIS" PREAMBLE="$PREAMBLE" MAX_CHARS="$MAX_CHARS" SYSTEM_MESSAGE="$SYSTEM_MESSAGE" "$PY" <<'PY'
 import os, json
 a = os.environ.get("CODEX_ANALYSIS", "")
 p = os.environ.get("PREAMBLE", "")
+system_message = os.environ.get("SYSTEM_MESSAGE", "")
 try: m = int(os.environ.get("MAX_CHARS", "12000"))
 except Exception: m = 12000
 if len(a) > m: a = a[:m] + "\n\n[...Codex output truncated...]"
 ctx = p + "\n\n--- BEGIN CODEX ANALYSIS ---\n" + a + "\n--- END CODEX ANALYSIS ---"
-print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))
+payload = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}
+if system_message:
+    payload["systemMessage"] = system_message
+print(json.dumps(payload))
 PY
 cf_dbg "injected $(printf '%s' "$ANALYSIS" | wc -c) chars fanout=$FANOUT_USED"
 exit 0
