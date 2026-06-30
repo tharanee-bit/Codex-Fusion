@@ -33,6 +33,10 @@ cf_subagent_mode() {
   esac
 }
 
+cf_notify_enabled() {
+  [ "${CODEX_FUSION_NOTIFY:-1}" != "0" ]
+}
+
 cf_setup_codex_runtime() {
   PY="/usr/bin/python3"
   [ -x "$PY" ] || PY="$(command -v python3 2>/dev/null)"

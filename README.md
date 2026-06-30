@@ -36,7 +36,7 @@ Claude stays the editor and the final judge. Codex only advises and reviews — 
    1 or more codex exec --sandbox read-only peers
         │
         ▼
-   synthesized analysis injected as additionalContext
+   synthesized analysis injected as additionalContext + visible systemMessage
         │
         ▼
    Claude synthesizes Claude + Codex, then edits
@@ -57,6 +57,12 @@ tracked/untracked review surface, so pre-existing dirty work does not trigger an
 while an unchanged already-reviewed surface does not get reviewed again on every later Stop.
 If a Stop review path fails transiently, the unchanged diff is retried a bounded number of times and
 then skipped until the diff changes.
+
+Claude Code also shows a live hook status message while Codex Fusion runs. After a successful
+pre-prompt consult, Codex Fusion emits a human-facing `systemMessage`; fanout notices include the
+actual spawned sub-agent count and how many returned usable output. Fanout Stop reviews emit the
+same count when they block on `ISSUES_FOUND`, and emit a PASS notice when all spawned review agents
+pass.
 
 ## Requirements
 
@@ -102,6 +108,7 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | `CODEX_FUSION_MAX_AGENTS` | `4` | Hard cap for hook-launched Codex agents and any bounded internal delegation contract. |
 | `CODEX_FUSION_TIMEOUT` | `180` | Per-agent timeout in seconds. The Claude hook registration timeout remains 270s. |
 | `CODEX_FUSION_STOP_RETRY_LIMIT` | `2` | Number of transient failed Stop review attempts for an unchanged diff before skipping. |
+| `CODEX_FUSION_NOTIFY` | `1` | Set to `0` to suppress human-facing success `systemMessage` notices. Context injection and blocking review reasons still work. |
 | `CODEX_FUSION_DEBUG=1` | off | Logs gate decisions to `${TMPDIR:-/tmp}/codex-fusion-state/debug.log`. |
 
 > **Strongest model, extra-high effort.** Codex Fusion runs on the best Codex model at `xhigh`
@@ -131,6 +138,9 @@ as long prompts, multi-line plans, implementation/review/migration keywords, aut
 concurrency terms, or a multi-file dirty tree. Stop fanout runs when forced, always-enabled, or when
 the incremental diff is large, spans at least three files, or touches high-risk areas such as auth,
 security, database/schema/migrations, concurrency, or tests.
+
+The live `statusMessage` is static while the hook runs. Dynamic sub-agent counts appear after fanout
+finishes, for example: `Codex Fusion: spawned 3 sub-agents; 3/3 succeeded.`
 
 ## Safety model
 

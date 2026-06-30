@@ -150,16 +150,46 @@ class HookTestCase(unittest.TestCase):
             {"prompt": "what does this function do?", "cwd": str(self.repo), "session_id": "single"},
         )
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("AUTOMATIC CODEX FUSION CONTEXT", json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"])
+        payload = json.loads(res.stdout)
+        self.assertIn("AUTOMATIC CODEX FUSION CONTEXT", payload["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(payload["systemMessage"], "Codex Fusion: Codex consulted successfully.")
         self.assertEqual([entry["role"] for entry in self.read_log()], ["single"])
 
     def test_auto_fanout_for_high_risk_prompt(self):
         prompt = "Implement the auth database migration plan.\nFix the race condition.\nAdd tests.\nReview security."
         res = self.run_hook(USERPROMPT_HOOK, {"prompt": prompt, "cwd": str(self.repo), "session_id": "auto"})
         self.assertEqual(res.returncode, 0, res.stderr)
-        context = json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"]
+        payload = json.loads(res.stdout)
+        context = payload["hookSpecificOutput"]["additionalContext"]
         self.assertIn("sub-agent fanout", context)
+        self.assertIn("spawned 3 sub-agents; 3/3 succeeded", context)
+        self.assertEqual(payload["systemMessage"], "Codex Fusion: spawned 3 sub-agents; 3/3 succeeded.")
         self.assertEqual([entry["role"] for entry in self.read_log()], ["planner", "skeptic", "verifier"])
+
+    def test_forced_fanout_reports_reduced_spawn_count(self):
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "tiny request [subagents]", "cwd": str(self.repo), "session_id": "twospawn"},
+            CODEX_FUSION_MAX_AGENTS="2",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        context = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("spawned 2 sub-agents; 2/2 succeeded", context)
+        self.assertEqual(payload["systemMessage"], "Codex Fusion: spawned 2 sub-agents; 2/2 succeeded.")
+        self.assertEqual([entry["role"] for entry in self.read_log()], ["planner", "skeptic"])
+
+    def test_notify_zero_suppresses_userprompt_system_message_only(self):
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "what does this function do?", "cwd": str(self.repo), "session_id": "notifyoff"},
+            CODEX_FUSION_NOTIFY="0",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertNotIn("systemMessage", payload)
+        self.assertIn("AUTOMATIC CODEX FUSION CONTEXT", payload["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual([entry["role"] for entry in self.read_log()], ["single"])
 
     def test_ci_substring_does_not_force_prompt_fanout(self):
         res = self.run_hook(
@@ -232,12 +262,29 @@ class HookTestCase(unittest.TestCase):
         self.modify_repo()
         res = self.run_hook(STOP_HOOK, {"cwd": str(self.repo), "session_id": "pass", "stop_hook_active": False})
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual(res.stdout, "")
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["systemMessage"], "Codex Fusion: spawned 3 review sub-agents; all 3 passed.")
         self.assertCountEqual(
             [entry["role"] for entry in self.read_log()],
             ["correctness", "security-data-loss-concurrency", "tests-regression"],
         )
         self.assertTrue(self.state_file("pass", "reviewed").exists())
+
+    def test_notify_zero_suppresses_stop_fanout_pass_system_message(self):
+        self.baseline("stopnotifyoff")
+        self.modify_repo()
+        res = self.run_hook(
+            STOP_HOOK,
+            {"cwd": str(self.repo), "session_id": "stopnotifyoff", "stop_hook_active": False},
+            CODEX_FUSION_NOTIFY="0",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+        self.assertCountEqual(
+            [entry["role"] for entry in self.read_log()],
+            ["correctness", "security-data-loss-concurrency", "tests-regression"],
+        )
+        self.assertTrue(self.state_file("stopnotifyoff", "reviewed").exists())
 
     def test_db_substring_does_not_force_stop_fanout(self):
         self.baseline("dbg", prompt="baseline")
@@ -258,6 +305,7 @@ class HookTestCase(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         payload = json.loads(res.stdout)
         self.assertEqual(payload["decision"], "block")
+        self.assertIn("spawned 3 review sub-agents; 3/3 succeeded", payload["reason"])
         self.assertIn("security-data-loss-concurrency", payload["reason"])
         self.assertTrue(self.state_file("issues", "reviewed").exists())
 
@@ -285,6 +333,39 @@ class HookTestCase(unittest.TestCase):
 
     def test_installer_copies_common_hook_and_is_idempotent(self):
         config_dir = self.base / "claude"
+        hooks_dir = config_dir / "hooks"
+        config_dir.mkdir()
+        (config_dir / "settings.json").write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "UserPromptSubmit": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": str(hooks_dir / "codex-fusion-userprompt.sh"),
+                                        "timeout": 30,
+                                    }
+                                ]
+                            }
+                        ],
+                        "Stop": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": str(hooks_dir / "codex-fusion-stop.sh"),
+                                        "timeout": 30,
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
         env = self.env(CLAUDE_CONFIG_DIR=str(config_dir))
         for _ in range(2):
             res = subprocess.run([str(INSTALL)], cwd=ROOT, text=True, capture_output=True, env=env, timeout=20)
@@ -294,14 +375,20 @@ class HookTestCase(unittest.TestCase):
         self.assertTrue((config_dir / "hooks" / "codex-fusion-userprompt.sh").exists())
         self.assertTrue((config_dir / "hooks" / "codex-fusion-stop.sh").exists())
         settings = json.loads((config_dir / "settings.json").read_text(encoding="utf-8"))
+        expected_status = {
+            "UserPromptSubmit": "Codex Fusion: checking Codex...",
+            "Stop": "Codex Fusion: reviewing changes...",
+        }
         for event in ("UserPromptSubmit", "Stop"):
-            commands = [
-                hook["command"]
+            hooks = [
+                hook
                 for group in settings["hooks"][event]
                 for hook in group["hooks"]
                 if "codex-fusion" in hook["command"]
             ]
-            self.assertEqual(len(commands), 1)
+            self.assertEqual(len(hooks), 1)
+            self.assertEqual(hooks[0]["timeout"], 270)
+            self.assertEqual(hooks[0]["statusMessage"], expected_status[event])
 
 
 if __name__ == "__main__":

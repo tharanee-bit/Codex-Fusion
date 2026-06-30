@@ -280,8 +280,10 @@ $_content
   done
 
   if [ "$ISSUE_COUNT" -gt 0 ]; then
+    REVIEW_FANOUT_SPAWNED="${#SELECTED_ROLES[@]}"
+    REVIEW_FANOUT_SUCCEEDED="$SUCCESS_COUNT"
     REVIEW="CODEX_REVIEW_VERDICT: ISSUES_FOUND
-Codex Fusion used bounded read-only post-diff review fanout. $ISSUE_COUNT agent(s) reported serious issues.
+Codex Fusion used bounded read-only post-diff review fanout (spawned $REVIEW_FANOUT_SPAWNED review sub-agents; $REVIEW_FANOUT_SUCCEEDED/$REVIEW_FANOUT_SPAWNED succeeded). $ISSUE_COUNT agent(s) reported serious issues.
 $REVIEW"
     [ -n "$FAILED_ROLES" ] && REVIEW="${REVIEW}
 ## Fanout Notes
@@ -291,12 +293,18 @@ Failed agents:$FAILED_ROLES
     REVIEW=""
     return 2
   else
+    REVIEW_FANOUT_SPAWNED="${#SELECTED_ROLES[@]}"
+    REVIEW_FANOUT_SUCCEEDED="$SUCCESS_COUNT"
     REVIEW="CODEX_REVIEW_VERDICT: PASS
-Codex Fusion used bounded read-only post-diff review fanout. All $SUCCESS_COUNT review agents passed."
+Codex Fusion used bounded read-only post-diff review fanout (spawned $REVIEW_FANOUT_SPAWNED review sub-agents; all $REVIEW_FANOUT_SUCCEEDED passed)."
   fi
+  FANOUT_REVIEW_USED=1
   return 0
 }
 
+FANOUT_REVIEW_USED=0
+REVIEW_FANOUT_SPAWNED=0
+REVIEW_FANOUT_SUCCEEDED=0
 if [ "$SHOULD_FANOUT" = "1" ]; then
   cf_dbg "stop fanout selected pref=$SUBAGENT_PREF max=$CODEX_MAX_AGENTS files=$(cf_changed_file_count "$CHANGED")"
   run_fanout_review
@@ -319,6 +327,12 @@ VERDICT_LINE="$(cf_first_nonempty_line "$REVIEW")"
 if ! printf '%s' "$VERDICT_LINE" | grep -qiE 'CODEX_REVIEW_VERDICT:[[:space:]]*ISSUES_FOUND'; then
   store_reviewed
   clear_review_failure
+  if [ "$FANOUT_REVIEW_USED" = "1" ] && cf_notify_enabled; then
+    SYSTEM_MESSAGE="Codex Fusion: spawned $REVIEW_FANOUT_SPAWNED review sub-agents; all $REVIEW_FANOUT_SUCCEEDED passed." "$PY" <<'PY'
+import os, json
+print(json.dumps({"systemMessage": os.environ.get("SYSTEM_MESSAGE", "")}))
+PY
+  fi
   cf_dbg "verdict PASS/none -> exit"
   exit 0
 fi

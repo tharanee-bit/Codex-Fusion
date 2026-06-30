@@ -6,7 +6,8 @@
           {
             "type": "command",
             "command": "$HOME/.claude/hooks/codex-fusion-userprompt.sh",
-            "timeout": 270
+            "timeout": 270,
+            "statusMessage": "Codex Fusion: checking Codex..."
           }
         ]
       }
@@ -17,7 +18,8 @@
           {
             "type": "command",
             "command": "$HOME/.claude/hooks/codex-fusion-stop.sh",
-            "timeout": 270
+            "timeout": 270,
+            "statusMessage": "Codex Fusion: reviewing changes..."
           }
         ]
       }
