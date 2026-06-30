@@ -8,7 +8,8 @@ user-invocable: false
 
 When the conversation contains **AUTOMATIC CODEX FUSION CONTEXT** (injected by the
 `codex-fusion-userprompt.sh` hook), treat Codex as an independent peer reviewer whose analysis
-you must reconcile with your own **before making any edits**.
+you must reconcile with your own **before making any edits**. The context may contain one Codex
+report or several bounded Codex sub-agent reports.
 
 ## Process
 1. Form your own plan first — do not anchor on Codex.
@@ -18,15 +19,19 @@ you must reconcile with your own **before making any edits**.
    - **Codex-only insights** — useful points Codex raised that you missed.
    - **Claude-only concerns** — risks/considerations Codex missed.
    - **Final decision** — your chosen approach.
+   If multiple Codex Fusion sub-agent reports are present, synthesize by evidence quality, source
+   references, and risk coverage — not by vote count. Preserve a minority concern when it has the
+   strongest evidence.
 3. You remain the final judge. Do **not** blindly obey Codex; reject its suggestions when you have
    a sound reason, and say so.
 4. Prefer **minimal, testable** changes.
 5. After editing, run the relevant **tests / lint / typecheck** for the project.
 
 ## Post-diff review (Stop hook)
-If a **POST-DIFF REVIEW** from Codex appears, address every serious issue (correctness, security,
-data-loss, concurrency, broken tests) before finalizing, or explicitly justify why each is not a
-real problem.
+If a **POST-DIFF REVIEW** from Codex appears, it may aggregate several review sub-agents. Address
+every serious issue (correctness, security, data-loss, concurrency, broken tests) before finalizing,
+or explicitly justify why each is not a real problem. Treat stronger evidence as more important
+than the number of agents that reported it.
 
 ## Required final summary
 End your response with a short **Codex Fusion summary**:

@@ -45,6 +45,6 @@ print("Removed Codex Fusion hook entries from settings.json (backup: *.codex-fus
 PY
 fi
 
-rm -f "$CLAUDE_DIR/hooks/codex-fusion-userprompt.sh" "$CLAUDE_DIR/hooks/codex-fusion-stop.sh"
+rm -f "$CLAUDE_DIR/hooks/codex-fusion-common.sh" "$CLAUDE_DIR/hooks/codex-fusion-userprompt.sh" "$CLAUDE_DIR/hooks/codex-fusion-stop.sh"
 rm -rf "$CLAUDE_DIR/skills/codex-fusion-auto"
 echo "Removed hook scripts and skill. Restart Claude Code to apply."
