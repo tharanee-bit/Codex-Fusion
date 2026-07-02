@@ -38,48 +38,55 @@ case "$SESSION_ID" in *[!A-Za-z0-9._-]*|.|..) SESSION_ID="";; esac
 [ -n "$PROMPT" ] || exit 0
 [ -d "$CWD" ] || CWD="$PWD"
 
-state_key() {
-  if [ -n "$SESSION_ID" ]; then
-    printf 'session-%s' "$SESSION_ID"
-  else
-    CWD_HASH="$(printf '%s' "$CWD" | git hash-object --stdin 2>/dev/null)"
-    printf 'cwd-%s' "${CWD_HASH:-unknown}"
-  fi
-}
-
-review_surface() {
-  git -C "$CWD" rev-parse --verify HEAD >/dev/null 2>&1 || return 1
-  printf '### tracked diff against HEAD\n'
-  git -C "$CWD" diff HEAD -- 2>/dev/null || return 1
-  printf '\n### untracked files\n'
-  git -C "$CWD" ls-files --others --exclude-standard -z 2>/dev/null |
-    while IFS= read -r -d '' f; do
-      printf '\n--- untracked file: %s ---\n' "$f"
-      git -C "$CWD" diff --no-index -- /dev/null "$CWD/$f" 2>/dev/null || true
-    done
-}
-
-STATE_KEY="$(state_key)"
+STATE_KEY="$(cf_state_key "$SESSION_ID" "$CWD")"
 BASELINE_FILE="$STATE_DIR/$STATE_KEY.baseline"
+HEAD_FILE="$STATE_DIR/$STATE_KEY.head"
 NO_REVIEW_FILE="$STATE_DIR/$STATE_KEY.no-review"
 SUBAGENTS_FILE="$STATE_DIR/$STATE_KEY.subagents"
-if mkdir -p -m 700 "$STATE_DIR" 2>/dev/null; then
+NOGIT_MARKER="$STATE_DIR/$STATE_KEY.nogit-warned"
+if cf_ensure_state_dir; then
   rm -f "$NO_REVIEW_FILE" 2>/dev/null
-  if review_surface >"$BASELINE_FILE" 2>/dev/null; then
+  if cf_review_surface "$CWD" HEAD >"$BASELINE_FILE" 2>/dev/null; then
+    # Record the prompt-time HEAD so the Stop hook diffs against it even if Claude commits mid-turn.
+    git -C "$CWD" rev-parse --verify HEAD >"$HEAD_FILE" 2>/dev/null || rm -f "$HEAD_FILE" 2>/dev/null
     cf_dbg "baselined review surface ($STATE_KEY)"
   else
-    rm -f "$BASELINE_FILE" 2>/dev/null
+    rm -f "$BASELINE_FILE" "$HEAD_FILE" 2>/dev/null
     cf_dbg "baseline unavailable ($STATE_KEY)"
   fi
 fi
 
-case "$PROMPT" in *"[no-codex]"*) : >"$NO_REVIEW_FILE" 2>/dev/null; rm -f "$SUBAGENTS_FILE" 2>/dev/null; cf_dbg "skip: [no-codex]"; exit 0;; esac
+# Outside a git repo the Stop-hook diff review can never run; that must be visible, not silent.
+# Warn once per session via systemMessage on whichever payload this invocation emits.
+NONGIT_WARNING=""
+if ! git -C "$CWD" rev-parse --verify HEAD >/dev/null 2>&1 && [ ! -f "$NOGIT_MARKER" ]; then
+  NONGIT_WARNING="Codex Fusion: $CWD is not a git repository (or has no commits), so the Stop-hook diff review is disabled for this session. Open a repository folder to re-enable it."
+fi
+
+mark_nogit_warned() {
+  [ -n "$NONGIT_WARNING" ] || return 0
+  cf_ensure_state_dir && : >"$NOGIT_MARKER" 2>/dev/null
+}
+
+finish_skip() {
+  if [ -n "$NONGIT_WARNING" ]; then
+    mark_nogit_warned
+    NONGIT_WARNING="$NONGIT_WARNING" "$PY" -c 'import os, json; print(json.dumps({"systemMessage": os.environ.get("NONGIT_WARNING", "")}))' 2>/dev/null
+  fi
+  exit 0
+}
+
+case "$PROMPT" in *"[no-codex]"*) : >"$NO_REVIEW_FILE" 2>/dev/null; rm -f "$SUBAGENTS_FILE" 2>/dev/null; cf_dbg "skip: [no-codex]"; finish_skip;; esac
 
 ACK_RE='^[[:space:]]*((thanks|thank you|thx|ok|okay|cool|nice|great|got it|hi|hello|hey|yo|sup|yes|no|sure|nvm|never ?mind|lgtm)[[:punct:][:space:]]*)+$'
-printf '%s' "$PROMPT" | grep -ziqE "$ACK_RE" && { : >"$NO_REVIEW_FILE" 2>/dev/null; rm -f "$SUBAGENTS_FILE" 2>/dev/null; cf_dbg "skip: conversational"; exit 0; }
+printf '%s' "$PROMPT" | grep -ziqE "$ACK_RE" && { : >"$NO_REVIEW_FILE" 2>/dev/null; rm -f "$SUBAGENTS_FILE" 2>/dev/null; cf_dbg "skip: conversational"; finish_skip; }
 
-GITSTATUS="$(git -C "$CWD" status --short 2>/dev/null | head -c 4000)"
+GITSTATUS="$(cf_filtered_status "$CWD" | head -c 4000)"
 [ -n "$GITSTATUS" ] || GITSTATUS="(clean or not a git repository)"
+
+# The codex prompt travels as a single argv string; Linux caps one argv/env string at ~128KiB
+# (MAX_ARG_STRLEN), so cap the embedded user prompt or a giant paste silently kills every consult.
+PROMPT_EMBED="$(cf_truncate_bytes "$PROMPT" 60000 "user prompt")"
 
 SUBAGENT_PREF="$(cf_prompt_subagent_preference "$PROMPT")"
 printf '%s\n' "$SUBAGENT_PREF" >"$SUBAGENTS_FILE" 2>/dev/null
@@ -96,7 +103,7 @@ Do not inspect credentials, tokens, .env files, keychains, shell history, or aut
 Focus only on the user's coding task and the repository context.
 
 User task:
-$PROMPT
+$PROMPT_EMBED
 
 Repository:
 $CWD
@@ -259,10 +266,10 @@ if [ "$SHOULD_FANOUT" = "1" ]; then
   cf_dbg "fanout selected pref=$SUBAGENT_PREF max=$CODEX_MAX_AGENTS score=$(cf_userprompt_auto_score "$PROMPT" "$GITSTATUS")"
   run_fanout
   FANOUT_RC=$?
-  [ "$FANOUT_RC" -eq 0 ] || exit 0
+  [ "$FANOUT_RC" -eq 0 ] || finish_skip
 else
   cf_dbg "single selected pref=$SUBAGENT_PREF max=$CODEX_MAX_AGENTS score=$(cf_userprompt_auto_score "$PROMPT" "$GITSTATUS")"
-  run_single || exit 0
+  run_single || finish_skip
 fi
 
 if [ "$FANOUT_USED" = "1" ]; then
@@ -283,15 +290,27 @@ if cf_notify_enabled; then
     SYSTEM_MESSAGE="Codex Fusion: Codex consulted successfully."
   fi
 fi
+if [ -n "$NONGIT_WARNING" ]; then
+  # The non-git warning is not a success notice; CODEX_FUSION_NOTIFY=0 must not hide it.
+  mark_nogit_warned
+  SYSTEM_MESSAGE="${SYSTEM_MESSAGE:+$SYSTEM_MESSAGE }$NONGIT_WARNING"
+fi
 
-CODEX_ANALYSIS="$ANALYSIS" PREAMBLE="$PREAMBLE" MAX_CHARS="$MAX_CHARS" SYSTEM_MESSAGE="$SYSTEM_MESSAGE" "$PY" <<'PY'
+# Shell-side cap BEFORE the env handoff: a single env string over ~128KiB fails execve (E2BIG) and
+# the python emitter (with its own finer truncation) would never run at all.
+CODEX_ANALYSIS="$(cf_truncate_bytes "$ANALYSIS" 100000 "codex analysis")" PREAMBLE="$PREAMBLE" MAX_CHARS="$MAX_CHARS" SYSTEM_MESSAGE="$SYSTEM_MESSAGE" "$PY" <<'PY'
 import os, json
 a = os.environ.get("CODEX_ANALYSIS", "")
 p = os.environ.get("PREAMBLE", "")
 system_message = os.environ.get("SYSTEM_MESSAGE", "")
 try: m = int(os.environ.get("MAX_CHARS", "12000"))
 except Exception: m = 12000
-if len(a) > m: a = a[:m] + "\n\n[...Codex output truncated...]"
+if len(a) > m:
+    a = a[:m]
+    cut = a.rfind("\n")
+    if cut > 0:
+        a = a[:cut]
+    a += "\n\n[...Codex output truncated at " + str(m) + " chars...]"
 ctx = p + "\n\n--- BEGIN CODEX ANALYSIS ---\n" + a + "\n--- END CODEX ANALYSIS ---"
 payload = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}
 if system_message:

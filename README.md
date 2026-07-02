@@ -51,12 +51,19 @@ Claude stays the editor and the final judge. Codex only advises and reviews — 
         └─ verdict ISSUES_FOUND ──▶ Claude must address them first (blocks once)
 ```
 
-The UserPromptSubmit hook records a prompt-start review-surface baseline in
-`${TMPDIR:-/tmp}/codex-fusion-state/`. The Stop hook compares that baseline to the current
-tracked/untracked review surface, so pre-existing dirty work does not trigger an unrelated review,
-while an unchanged already-reviewed surface does not get reviewed again on every later Stop.
-If a Stop review path fails transiently, the unchanged diff is retried a bounded number of times and
-then skipped until the diff changes.
+The UserPromptSubmit hook records a prompt-start review-surface baseline plus the prompt-time
+`HEAD` commit in `${TMPDIR:-/tmp}/codex-fusion-state-<uid>/` (per-user, mode 0700, ownership
+validated before use; an old shared `/tmp/codex-fusion-state` dir from earlier versions can be
+deleted). The Stop hook diffs the working tree against that prompt-time commit and compares the
+result to the baseline, so pre-existing dirty work does not trigger an unrelated review, commits
+made mid-turn still get reviewed, and an unchanged already-reviewed surface does not get reviewed
+again on every later Stop. If a Stop review path fails transiently, the unchanged diff is retried a
+bounded number of times and then skipped until the diff changes.
+
+If the working directory is not a git repository (for example a folder that merely contains
+repositories), the Stop diff review cannot run; Codex Fusion tells you so once per session via a
+visible `systemMessage` instead of failing silently. Open a concrete repository folder to get the
+post-diff review back.
 
 Claude Code also shows a live hook status message while Codex Fusion runs. After a successful
 pre-prompt consult, Codex Fusion emits a human-facing `systemMessage`; fanout notices include the
@@ -108,8 +115,10 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | `CODEX_FUSION_MAX_AGENTS` | `4` | Hard cap for hook-launched Codex agents and any bounded internal delegation contract. |
 | `CODEX_FUSION_TIMEOUT` | `180` | Per-agent timeout in seconds. The Claude hook registration timeout remains 270s. |
 | `CODEX_FUSION_STOP_RETRY_LIMIT` | `2` | Number of transient failed Stop review attempts for an unchanged diff before skipping. |
-| `CODEX_FUSION_NOTIFY` | `1` | Set to `0` to suppress human-facing success `systemMessage` notices. Context injection and blocking review reasons still work. |
-| `CODEX_FUSION_DEBUG=1` | off | Logs gate decisions to `${TMPDIR:-/tmp}/codex-fusion-state/debug.log`. |
+| `CODEX_FUSION_NOTIFY` | `1` | Set to `0` to suppress human-facing success `systemMessage` notices. Context injection, blocking review reasons, and the non-git-repo warning still work. |
+| `CODEX_FUSION_EXCLUDE` | — | Extra space-separated globs to exclude from every review surface, on top of the built-in sensitive-path denylist (globs containing spaces are unsupported). |
+| `CODEX_FUSION_MAX_FILE_BYTES` | `204800` | Per-file size cap for untracked files embedded in the review surface; larger files appear as an exclusion marker only. |
+| `CODEX_FUSION_DEBUG=1` | off | Logs gate decisions to `${TMPDIR:-/tmp}/codex-fusion-state-<uid>/debug.log`. |
 
 > **Strongest model, extra-high effort.** Codex Fusion runs on the best Codex model at `xhigh`
 > (extra-high) reasoning effort by default, so the second opinion is as strong as possible. The model
@@ -145,8 +154,18 @@ finishes, for example: `Codex Fusion: spawned 3 sub-agents; 3/3 succeeded.`
 ## Safety model
 
 - Codex always runs `--ask-for-approval never --sandbox read-only` — it cannot edit files or run
-  destructive commands. The prompt also explicitly tells Codex not to inspect credentials, `.env`,
-  tokens, keychains, shell history, or auth files.
+  destructive commands.
+- **Sensitive paths never reach Codex.** Review surfaces, diffs, and `git status` output are
+  filtered at the source against a denylist of secret-bearing paths (env files, keys and
+  certificates, `credentials*`/`secrets*`, shell history, `.netrc`/`.npmrc`/`.pypirc`,
+  `auth.json`, SQLite databases, `.ssh`/`.aws`/`.gnupg` contents — extensible via
+  `CODEX_FUSION_EXCLUDE`). Excluded files appear only as an `(excluded: ...)` marker; oversized
+  and binary untracked files are likewise replaced with markers. The prompt additionally tells
+  Codex not to inspect credentials, but the guarantee is the source-level exclusion, not that
+  instruction. Known limit: the filter is path-based, so if a turn renames a secret file to a
+  non-denylisted name, the content appears in the diff under its new name.
+- State lives in a per-user, mode-0700 directory whose ownership is verified before every use, so a
+  hostile co-tenant on shared `/tmp` cannot pre-create or poison it.
 - Hook-launched sub-agents are separate read-only `codex exec` subprocesses with separate output
   files. Fanout roles do not recursively spawn nested agents; they return delegation requests instead.
 - Both hooks **never block** Claude on the no-action path — they always exit 0. If Codex is missing,

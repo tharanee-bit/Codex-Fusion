@@ -4,17 +4,47 @@
 cf_init_common() {
   CF_LOG_PREFIX="$1"
   export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
-  STATE_DIR="${TMPDIR:-/tmp}/codex-fusion-state"
+  # Per-user state dir, mode 0700. On a shared /tmp a hostile co-tenant could otherwise pre-create a
+  # predictable shared dir and read/poison our baselines, so we also refuse a dir we do not own.
+  STATE_DIR="${TMPDIR:-/tmp}/codex-fusion-state-$(id -u 2>/dev/null || echo 0)"
   CODEX_TIMEOUT="${CODEX_FUSION_TIMEOUT:-180}"
   CODEX_MODEL="${CODEX_FUSION_MODEL:-gpt-5.5}"
   CODEX_REASONING="${CODEX_FUSION_EFFORT:-xhigh}"
   CODEX_MAX_AGENTS="$(cf_positive_int "${CODEX_FUSION_MAX_AGENTS:-4}" 4)"
+  CF_MAX_UNTRACKED_BYTES="$(cf_positive_int "${CODEX_FUSION_MAX_FILE_BYTES:-204800}" 204800)"
+  # Paths matched (lowercased, basename and full relative path) against these globs are excluded
+  # from every review surface, git status, and diff before anything is handed to Codex. Extend with
+  # CODEX_FUSION_EXCLUDE (extra space-separated globs; globs containing spaces are unsupported).
+  CF_SENSITIVE_GLOBS='.env .env.* *.env .envrc
+*.pem *.key *.p12 *.pfx *.jks *.keystore *.kdbx *.ppk
+id_rsa* id_dsa* id_ecdsa* id_ed25519* *_rsa *_dsa *_ecdsa *_ed25519
+credentials* *credentials.json secrets* secret.* *history .netrc _netrc .npmrc .pypirc .git-credentials .htpasswd auth.json
+*.sqlite *.sqlite3 *.db
+.ssh/* .aws/* .gnupg/*'
+  [ -n "${CODEX_FUSION_EXCLUDE:-}" ] && CF_SENSITIVE_GLOBS="$CF_SENSITIVE_GLOBS $CODEX_FUSION_EXCLUDE"
+}
+
+cf_ensure_state_dir() {
+  mkdir -p -m 700 "$STATE_DIR" 2>/dev/null || return 1
+  [ -O "$STATE_DIR" ] || return 1
 }
 
 cf_dbg() {
   [ "${CODEX_FUSION_DEBUG:-0}" = "1" ] || return 0
-  mkdir -p -m 700 "$STATE_DIR" 2>/dev/null || return 0
+  cf_ensure_state_dir || return 0
   printf '%s %s: %s\n' "$$" "$CF_LOG_PREFIX" "$*" >>"$STATE_DIR/debug.log"
+}
+
+cf_state_key() {
+  # $1 = sanitized session id, $2 = cwd. Fallback keys can collide: concurrent sessions in one cwd
+  # share a key, and without git every fallback collapses onto cwd-unknown. Accepted as-is because
+  # Claude Code always supplies session_id; the fallback only serves manual invocations.
+  if [ -n "$1" ]; then
+    printf 'session-%s' "$1"
+  else
+    _sk_hash="$(printf '%s' "$2" | git hash-object --stdin 2>/dev/null)"
+    printf 'cwd-%s' "${_sk_hash:-unknown}"
+  fi
 }
 
 cf_positive_int() {
@@ -35,6 +65,96 @@ cf_subagent_mode() {
 
 cf_notify_enabled() {
   [ "${CODEX_FUSION_NOTIFY:-1}" != "0" ]
+}
+
+cf_sensitive_path() {
+  _sp_path="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  _sp_base="${_sp_path##*/}"
+  # set -f: the glob words must reach the case patterns literally, not expand against the cwd.
+  set -f
+  for _sp_g in $CF_SENSITIVE_GLOBS; do
+    case "$_sp_base" in $_sp_g) set +f; return 0;; esac
+    case "$_sp_path" in $_sp_g|*/$_sp_g) set +f; return 0;; esac
+  done
+  set +f
+  return 1
+}
+
+cf_filtered_status() {
+  git -C "$1" status --short 2>/dev/null |
+    while IFS= read -r _fs_line; do
+      _fs_rest="${_fs_line:3}"
+      _fs_old="$_fs_rest"
+      _fs_new="$_fs_rest"
+      case "$_fs_rest" in *' -> '*) _fs_old="${_fs_rest%% -> *}"; _fs_new="${_fs_rest##* -> }";; esac
+      case "$_fs_old" in \"*\") _fs_old="${_fs_old#\"}"; _fs_old="${_fs_old%\"}";; esac
+      case "$_fs_new" in \"*\") _fs_new="${_fs_new#\"}"; _fs_new="${_fs_new%\"}";; esac
+      if cf_sensitive_path "$_fs_old" || cf_sensitive_path "$_fs_new"; then
+        printf '%s [redacted sensitive path]\n' "${_fs_line:0:2}"
+      else
+        printf '%s\n' "$_fs_line"
+      fi
+    done
+}
+
+cf_exclude_pathspecs() {
+  # Fills CF_EXCLUDES with ':(exclude,icase,top)' pathspecs for the tracked diff. Git pathspec
+  # wildcards cross '/' (fnmatch without FNM_PATHNAME), so G plus */G covers root-level and nested
+  # matches. The 'top' magic anchors the globs to the repo root: without it git prefixes pathspecs
+  # with the cwd-relative path, and a session cwd inside a subdirectory would stop the excludes
+  # from matching denylisted files elsewhere in the repo (a real leak, not a corner case).
+  CF_EXCLUDES=()
+  set -f
+  for _ep_g in $CF_SENSITIVE_GLOBS; do
+    CF_EXCLUDES+=(":(exclude,icase,top)$_ep_g" ":(exclude,icase,top)*/$_ep_g")
+  done
+  set +f
+}
+
+cf_review_surface() {
+  # $1 = repo dir, $2 = base ref (HEAD at prompt time; the stored prompt-time SHA at stop time).
+  # Baseline and Stop hash-compare these surfaces, so every line here must be deterministic and the
+  # section headers must not embed the ref itself.
+  _rs_cwd="$1"
+  _rs_base="$2"
+  git -C "$_rs_cwd" rev-parse --verify --quiet "$_rs_base^{commit}" >/dev/null 2>&1 || return 1
+  cf_exclude_pathspecs
+  printf '### note: sensitive, oversized, and binary paths are excluded from this surface\n'
+  printf '### tracked diff against prompt-time base\n'
+  git -C "$_rs_cwd" diff "$_rs_base" -- "${CF_EXCLUDES[@]}" 2>/dev/null || return 1
+  printf '\n### untracked files\n'
+  git -C "$_rs_cwd" ls-files --others --exclude-standard -z 2>/dev/null |
+    while IFS= read -r -d '' _rs_f; do
+      if cf_sensitive_path "$_rs_f"; then
+        printf '\n--- untracked file: %s (excluded: sensitive path) ---\n' "$_rs_f"
+        continue
+      fi
+      _rs_sz="$(wc -c <"$_rs_cwd/$_rs_f" 2>/dev/null | tr -d ' ')"
+      if [ "${_rs_sz:-0}" -gt "$CF_MAX_UNTRACKED_BYTES" ]; then
+        printf '\n--- untracked file: %s (excluded: %s bytes exceeds %s cap) ---\n' "$_rs_f" "$_rs_sz" "$CF_MAX_UNTRACKED_BYTES"
+        continue
+      fi
+      if git -C "$_rs_cwd" diff --no-index --numstat -- /dev/null "$_rs_cwd/$_rs_f" 2>/dev/null | grep -q '^-'; then
+        printf '\n--- untracked file: %s (excluded: binary) ---\n' "$_rs_f"
+        continue
+      fi
+      printf '\n--- untracked file: %s ---\n' "$_rs_f"
+      git -C "$_rs_cwd" diff --no-index -- /dev/null "$_rs_cwd/$_rs_f" 2>/dev/null || true
+    done
+}
+
+cf_truncate_bytes() {
+  # $1 = text, $2 = byte cap, $3 = label for the marker. Cuts on a line boundary where possible and
+  # appends an explicit marker so Codex knows it reviewed a partial payload.
+  _tb_len="$(printf '%s' "$1" | wc -c | tr -d ' ')"
+  if [ "${_tb_len:-0}" -le "$2" ]; then
+    printf '%s' "$1"
+    return 0
+  fi
+  _tb_head="$(printf '%s' "$1" | head -c "$2")"
+  _tb_trim="${_tb_head%"${_tb_head##*$'\n'}"}"
+  [ -n "$_tb_trim" ] && _tb_head="$_tb_trim"
+  printf '%s\n[... %s truncated at %s bytes ...]\n' "$_tb_head" "$3" "$2"
 }
 
 cf_setup_codex_runtime() {

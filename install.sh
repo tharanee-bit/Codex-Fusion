@@ -29,20 +29,23 @@ echo "Installed hooks + skill into $CLAUDE_DIR"
 CF_UPS="$HOOKS_DIR/codex-fusion-userprompt.sh" \
 CF_STOP="$HOOKS_DIR/codex-fusion-stop.sh" \
 CF_SETTINGS="$SETTINGS" "$PY" - <<'PY'
-import json, os, sys, shutil
+import json, os, sys, shutil, tempfile
 
-settings = os.environ["CF_SETTINGS"]
+# realpath: users symlink settings.json into dotfile repos; os.replace on the symlink path would
+# swap the link itself for a regular file. Resolve first so the atomic write lands on the target.
+settings = os.path.realpath(os.environ["CF_SETTINGS"])
 ups, stop = os.environ["CF_UPS"], os.environ["CF_STOP"]
 
 data = {}
+orig_text = None
 if os.path.exists(settings):
     try:
         with open(settings) as f:
-            data = json.load(f)
+            orig_text = f.read()
+        data = json.loads(orig_text)
     except Exception as e:
         print(f"ERROR: {settings} is not valid JSON ({e}); aborting so it isn't clobbered.", file=sys.stderr)
         sys.exit(1)
-    shutil.copy2(settings, settings + ".codex-fusion.bak")
 
 if not isinstance(data, dict):
     print("ERROR: settings.json is not a JSON object; aborting.", file=sys.stderr); sys.exit(1)
@@ -55,16 +58,26 @@ HOOK_TIMEOUT = 270
 USERPROMPT_STATUS = "Codex Fusion: checking Codex..."
 STOP_STATUS = "Codex Fusion: reviewing changes..."
 
+def norm(cmd):
+    # Match by resolved path so a manually merged "$HOME/..." snippet entry is recognized as the
+    # same hook as the absolute path this installer registers (no duplicate entries at the seam).
+    return os.path.normpath(os.path.expanduser(os.path.expandvars(cmd or "")))
+
 def ensure(event, command, status_message):
     arr = hooks.setdefault(event, [])
+    target = norm(command)
     for grp in arr:
         for h in grp.get("hooks", []):
-            if h.get("command") == command:
-                # Already present: converge its config to the current value on re-run/upgrade.
-                h["type"] = "command"
-                h["timeout"] = HOOK_TIMEOUT
-                h["statusMessage"] = status_message
-                return False
+            if norm(h.get("command")) == target:
+                # Already present (keep its original command string): converge config on upgrade.
+                changed = False
+                if h.get("type") != "command":
+                    h["type"] = "command"; changed = True
+                if h.get("timeout") != HOOK_TIMEOUT:
+                    h["timeout"] = HOOK_TIMEOUT; changed = True
+                if h.get("statusMessage") != status_message:
+                    h["statusMessage"] = status_message; changed = True
+                return changed
     arr.append({
         "hooks": [{
             "type": "command",
@@ -75,15 +88,35 @@ def ensure(event, command, status_message):
     })
     return True
 
-added_ups = ensure("UserPromptSubmit", ups, USERPROMPT_STATUS)
-added_stop = ensure("Stop", stop, STOP_STATUS)
+changed_ups = ensure("UserPromptSubmit", ups, USERPROMPT_STATUS)
+changed_stop = ensure("Stop", stop, STOP_STATUS)
 
-os.makedirs(os.path.dirname(settings), exist_ok=True)
-with open(settings, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
+if not (changed_ups or changed_stop):
+    print("settings.json already has the Codex Fusion hooks; nothing to change.")
+    sys.exit(0)
 
-print(f"settings.json merged (UserPromptSubmit added: {added_ups}, Stop added: {added_stop})")
+# Back up the exact pre-change file, then swap atomically (temp + os.replace) so an interrupted
+# write can never leave settings.json truncated.
+d_name = os.path.dirname(settings) or "."
+os.makedirs(d_name, exist_ok=True)
+if orig_text is not None:
+    shutil.copy2(settings, settings + ".codex-fusion.bak")
+fd, tmp = tempfile.mkstemp(dir=d_name, prefix=".settings.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, settings)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+
+print(f"settings.json merged (UserPromptSubmit updated: {changed_ups}, Stop updated: {changed_stop})")
 PY
 
 echo

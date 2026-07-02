@@ -90,6 +90,10 @@ class HookTestCase(unittest.TestCase):
                 else:
                     content = f"analysis from {role}\\n"
 
+                bloat = int(os.environ.get("FAKE_CODEX_BLOAT", "0") or "0")
+                if bloat:
+                    content += "X" * bloat + "\\n"
+
                 if out:
                     with open(out, "w", encoding="utf-8") as f:
                         f.write(content)
@@ -99,9 +103,20 @@ class HookTestCase(unittest.TestCase):
             encoding="utf-8",
         )
         fake.chmod(0o755)
+        # The hooks force-prepend $HOME/.local/bin:...:/usr/local/bin:/usr/bin:/bin to PATH, so a
+        # real codex in a system dir would beat self.bin. Install the shim at the temp home's
+        # .local/bin (first PATH entry) so the fake always wins regardless of the host machine.
+        home_bin = self.home / ".local" / "bin"
+        home_bin.mkdir(parents=True, exist_ok=True)
+        home_fake = home_bin / "codex"
+        home_fake.write_text(fake.read_text(encoding="utf-8"), encoding="utf-8")
+        home_fake.chmod(0o755)
 
     def env(self, **extra):
         env = os.environ.copy()
+        for key in list(env):
+            if key.startswith(("CODEX_FUSION_", "CLAUDE_FUSION_", "FAKE_CODEX_")):
+                env.pop(key)
         env.update(
             {
                 "PATH": f"{self.bin}:{env.get('PATH', '')}",
@@ -133,8 +148,14 @@ class HookTestCase(unittest.TestCase):
     def clear_log(self):
         self.log.write_text("", encoding="utf-8")
 
+    def state_dir(self):
+        return self.tmpdir / f"codex-fusion-state-{os.getuid()}"
+
     def state_file(self, session, suffix):
-        return self.tmpdir / "codex-fusion-state" / f"session-{session}.{suffix}"
+        return self.state_dir() / f"session-{session}.{suffix}"
+
+    def codex_prompts(self):
+        return [entry["argv"][-1] for entry in self.read_log()]
 
     def baseline(self, session, prompt="baseline [subagents]"):
         res = self.run_hook(USERPROMPT_HOOK, {"prompt": prompt, "cwd": str(self.repo), "session_id": session})
@@ -143,6 +164,15 @@ class HookTestCase(unittest.TestCase):
 
     def modify_repo(self):
         (self.repo / "README.md").write_text("hello\nchanged\n", encoding="utf-8")
+
+    def commit_all(self, message):
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", message],
+            cwd=self.repo,
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
 
     def test_simple_prompt_uses_single_agent(self):
         res = self.run_hook(
@@ -154,6 +184,9 @@ class HookTestCase(unittest.TestCase):
         self.assertIn("AUTOMATIC CODEX FUSION CONTEXT", payload["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(payload["systemMessage"], "Codex Fusion: Codex consulted successfully.")
         self.assertEqual([entry["role"] for entry in self.read_log()], ["single"])
+        argv = self.read_log()[0]["argv"]
+        for token in ("--sandbox", "read-only", "--ask-for-approval", "never", "exec"):
+            self.assertIn(token, argv)
 
     def test_auto_fanout_for_high_risk_prompt(self):
         prompt = "Implement the auth database migration plan.\nFix the race condition.\nAdd tests.\nReview security."
@@ -164,7 +197,7 @@ class HookTestCase(unittest.TestCase):
         self.assertIn("sub-agent fanout", context)
         self.assertIn("spawned 3 sub-agents; 3/3 succeeded", context)
         self.assertEqual(payload["systemMessage"], "Codex Fusion: spawned 3 sub-agents; 3/3 succeeded.")
-        self.assertEqual([entry["role"] for entry in self.read_log()], ["planner", "skeptic", "verifier"])
+        self.assertCountEqual([entry["role"] for entry in self.read_log()], ["planner", "skeptic", "verifier"])
 
     def test_forced_fanout_reports_reduced_spawn_count(self):
         res = self.run_hook(
@@ -177,7 +210,7 @@ class HookTestCase(unittest.TestCase):
         context = payload["hookSpecificOutput"]["additionalContext"]
         self.assertIn("spawned 2 sub-agents; 2/2 succeeded", context)
         self.assertEqual(payload["systemMessage"], "Codex Fusion: spawned 2 sub-agents; 2/2 succeeded.")
-        self.assertEqual([entry["role"] for entry in self.read_log()], ["planner", "skeptic"])
+        self.assertCountEqual([entry["role"] for entry in self.read_log()], ["planner", "skeptic"])
 
     def test_notify_zero_suppresses_userprompt_system_message_only(self):
         res = self.run_hook(
@@ -217,7 +250,7 @@ class HookTestCase(unittest.TestCase):
             {"prompt": "tiny request [subagents]", "cwd": str(self.repo), "session_id": "forced"},
         )
         self.assertEqual(forced.returncode, 0, forced.stderr)
-        self.assertEqual([entry["role"] for entry in self.read_log()], ["planner", "skeptic", "verifier"])
+        self.assertCountEqual([entry["role"] for entry in self.read_log()], ["planner", "skeptic", "verifier"])
 
         self.clear_log()
         single = self.run_hook(
@@ -256,6 +289,9 @@ class HookTestCase(unittest.TestCase):
         calls = self.read_log()
         self.assertEqual([entry["role"] for entry in calls], ["single", "single"])
         self.assertEqual([entry["has_model"] for entry in calls], [True, False])
+        for entry in calls:
+            for token in ("--sandbox", "read-only", "--ask-for-approval", "never", "exec"):
+                self.assertIn(token, entry["argv"], "read-only contract must hold on the fallback attempt too")
 
     def test_stop_fanout_pass_stores_reviewed_hash(self):
         self.baseline("pass")
@@ -330,6 +366,270 @@ class HookTestCase(unittest.TestCase):
         self.assertEqual(third.returncode, 0, third.stderr)
         self.assertFalse(self.state_file("partial", "reviewed").exists())
         self.assertEqual(len(self.read_log()), 8)
+
+    def test_baseline_excludes_tracked_env_change(self):
+        (self.repo / ".env").write_text("API_KEY=old\n", encoding="utf-8")
+        self.commit_all("add env")
+        (self.repo / ".env").write_text("API_KEY=SECRET_VALUE_XYZ\n", encoding="utf-8")
+        (self.repo / "README.md").write_text("hello\nvisible change\n", encoding="utf-8")
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "what does this function do?", "cwd": str(self.repo), "session_id": "envx"},
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        baseline = self.state_file("envx", "baseline").read_text(encoding="utf-8")
+        self.assertIn("visible change", baseline)
+        self.assertNotIn("API_KEY", baseline)
+        self.assertIn("sensitive, oversized, and binary paths are excluded", baseline)
+        prompts = self.codex_prompts()
+        self.assertTrue(prompts)
+        for prompt in prompts:
+            self.assertNotIn("API_KEY", prompt)
+        self.assertTrue(any("[redacted sensitive path]" in prompt for prompt in prompts))
+
+    def test_stop_excludes_untracked_key_file(self):
+        self.baseline("keyfile")
+        (self.repo / "server.pem").write_text("-----BEGIN PRIVATE KEY-----\nHUSHHUSH\n", encoding="utf-8")
+        self.modify_repo()
+        res = self.run_hook(STOP_HOOK, {"cwd": str(self.repo), "session_id": "keyfile", "stop_hook_active": False})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        prompts = self.codex_prompts()
+        self.assertTrue(prompts)
+        for prompt in prompts:
+            self.assertNotIn("HUSHHUSH", prompt)
+        self.assertTrue(any("server.pem (excluded: sensitive path)" in prompt for prompt in prompts))
+
+    def test_oversized_untracked_file_capped(self):
+        self.baseline("bigfile")
+        (self.repo / "big.txt").write_text("A" * 300000, encoding="utf-8")
+        self.modify_repo()
+        res = self.run_hook(STOP_HOOK, {"cwd": str(self.repo), "session_id": "bigfile", "stop_hook_active": False})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        prompts = self.codex_prompts()
+        self.assertTrue(any("big.txt (excluded: 300000 bytes exceeds 204800 cap)" in prompt for prompt in prompts))
+        for prompt in prompts:
+            self.assertNotIn("AAAAAAAAAA", prompt)
+
+    def test_binary_untracked_file_marker(self):
+        self.baseline("binfile")
+        (self.repo / "blob.bin").write_bytes(b"\x00\x01\x02payload")
+        self.modify_repo()
+        res = self.run_hook(STOP_HOOK, {"cwd": str(self.repo), "session_id": "binfile", "stop_hook_active": False})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        prompts = self.codex_prompts()
+        self.assertTrue(any("blob.bin (excluded: binary)" in prompt for prompt in prompts))
+
+    def test_codex_fusion_exclude_extends_denylist(self):
+        self.baseline("customx")
+        (self.repo / "notes.customsecret").write_text("TOPSECRET\n", encoding="utf-8")
+        self.modify_repo()
+        res = self.run_hook(
+            STOP_HOOK,
+            {"cwd": str(self.repo), "session_id": "customx", "stop_hook_active": False},
+            CODEX_FUSION_EXCLUDE="*.customsecret",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        prompts = self.codex_prompts()
+        self.assertTrue(any("notes.customsecret (excluded: sensitive path)" in prompt for prompt in prompts))
+        for prompt in prompts:
+            self.assertNotIn("TOPSECRET", prompt)
+
+    def test_commit_during_turn_still_reviewed(self):
+        self.baseline("midcommit", prompt="baseline")
+        (self.repo / "README.md").write_text("hello\ncommitted change\n", encoding="utf-8")
+        self.commit_all("mid-turn commit")
+        res = self.run_hook(STOP_HOOK, {"cwd": str(self.repo), "session_id": "midcommit", "stop_hook_active": False})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        prompts = self.codex_prompts()
+        self.assertTrue(prompts, "stop review did not run after a mid-turn commit")
+        self.assertTrue(any("committed change" in prompt for prompt in prompts))
+        self.assertTrue(self.state_file("midcommit", "reviewed").exists())
+
+    def test_commit_during_turn_dirty_at_prompt(self):
+        (self.repo / "README.md").write_text("hello\nearly edit\n", encoding="utf-8")
+        self.baseline("dirtycommit", prompt="baseline")
+        self.commit_all("commit early edit")
+        (self.repo / "README.md").write_text("hello\nearly edit\nlate edit\n", encoding="utf-8")
+        res = self.run_hook(STOP_HOOK, {"cwd": str(self.repo), "session_id": "dirtycommit", "stop_hook_active": False})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        prompts = self.codex_prompts()
+        self.assertTrue(prompts)
+        joined = "\n".join(prompts)
+        self.assertIn("+late edit", joined)
+        self.assertNotIn("-+early edit", joined)
+
+    def test_unresolvable_base_sha_falls_back_to_head(self):
+        self.baseline("badsha")
+        head_file = self.state_file("badsha", "head")
+        self.assertTrue(head_file.exists())
+        head_file.write_text("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n", encoding="utf-8")
+        self.modify_repo()
+        res = self.run_hook(STOP_HOOK, {"cwd": str(self.repo), "session_id": "badsha", "stop_hook_active": False})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(self.codex_prompts())
+        self.assertTrue(self.state_file("badsha", "reviewed").exists())
+
+    def test_nongit_cwd_warns_once_per_session(self):
+        plain = self.base / "plaindir"
+        plain.mkdir()
+        first = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "what does this function do?", "cwd": str(plain), "session_id": "nogit"},
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        payload = json.loads(first.stdout)
+        self.assertIn("not a git repository", payload["systemMessage"])
+        self.assertIn("Codex consulted successfully", payload["systemMessage"])
+        second = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "what does this function do?", "cwd": str(plain), "session_id": "nogit"},
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        payload2 = json.loads(second.stdout)
+        self.assertNotIn("not a git repository", payload2.get("systemMessage", ""))
+
+    def test_nongit_cwd_warns_on_skip_paths(self):
+        plain = self.base / "plainskip"
+        plain.mkdir()
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "Refactor auth [no-codex]", "cwd": str(plain), "session_id": "nogitskip"},
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertEqual(set(payload.keys()), {"systemMessage"})
+        self.assertIn("not a git repository", payload["systemMessage"])
+        self.assertEqual(self.read_log(), [])
+
+    def test_state_dir_unusable_fails_open(self):
+        state_path = self.state_dir()
+        state_path.write_text("not a directory", encoding="utf-8")
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "what does this function do?", "cwd": str(self.repo), "session_id": "nostate"},
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertIn("AUTOMATIC CODEX FUSION CONTEXT", payload["hookSpecificOutput"]["additionalContext"])
+        stop = self.run_hook(STOP_HOOK, {"cwd": str(self.repo), "session_id": "nostate", "stop_hook_active": False})
+        self.assertEqual(stop.returncode, 0, stop.stderr)
+        self.assertEqual(stop.stdout, "")
+
+    def test_truncation_marker_on_large_diff(self):
+        self.baseline("bigdiff", prompt="baseline")
+        lines = "".join(f"line {i} padding padding padding\n" for i in range(1500))
+        (self.repo / "README.md").write_text("hello\n" + lines, encoding="utf-8")
+        res = self.run_hook(STOP_HOOK, {"cwd": str(self.repo), "session_id": "bigdiff", "stop_hook_active": False})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        prompts = self.codex_prompts()
+        self.assertTrue(any("[... incremental diff truncated at 20000 bytes ...]" in prompt for prompt in prompts))
+
+    def test_clean_tree_stop_skips_review(self):
+        self.baseline("cleantree", prompt="baseline")
+        res = self.run_hook(STOP_HOOK, {"cwd": str(self.repo), "session_id": "cleantree", "stop_hook_active": False})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+        self.assertEqual(self.read_log(), [], "unchanged surface must not trigger a review")
+        self.assertFalse(self.state_file("cleantree", "reviewed").exists())
+
+    def test_subdir_cwd_still_excludes_root_secrets(self):
+        (self.repo / ".env").write_text("ROOT=old\n", encoding="utf-8")
+        sub = self.repo / "sub"
+        sub.mkdir()
+        (sub / "code.py").write_text("print('v1')\n", encoding="utf-8")
+        self.commit_all("add env and subdir")
+        (self.repo / ".env").write_text("ROOT=ROOTSECRET_LEAK\n", encoding="utf-8")
+        (sub / "code.py").write_text("print('v2 visible')\n", encoding="utf-8")
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "what does this function do?", "cwd": str(sub), "session_id": "subdir"},
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        baseline = self.state_file("subdir", "baseline").read_text(encoding="utf-8")
+        self.assertIn("v2 visible", baseline)
+        self.assertNotIn("ROOTSECRET_LEAK", baseline, "cwd in a subdirectory must not bypass the exclude pathspecs")
+        for prompt in self.codex_prompts():
+            self.assertNotIn("ROOTSECRET_LEAK", prompt)
+
+    def test_huge_review_still_blocks(self):
+        self.baseline("hugereview", prompt="baseline")
+        self.modify_repo()
+        res = self.run_hook(
+            STOP_HOOK,
+            {"cwd": str(self.repo), "session_id": "hugereview", "stop_hook_active": False},
+            FAKE_CODEX_ISSUE_ROLES="single-review",
+            FAKE_CODEX_BLOAT="200000",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["decision"], "block", "a >128KiB review must not be dropped by the env handoff")
+        self.assertIn("issue from single-review", payload["reason"])
+        self.assertTrue(self.state_file("hugereview", "reviewed").exists())
+
+    def test_installer_norm_matching_no_duplicates(self):
+        config_dir = self.home / ".claude"
+        config_dir.mkdir(parents=True)
+        snippet = {
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "$HOME/.claude/hooks/codex-fusion-userprompt.sh",
+                                "timeout": 30,
+                            }
+                        ]
+                    }
+                ],
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "$HOME/.claude/hooks/codex-fusion-stop.sh",
+                                "timeout": 30,
+                            }
+                        ]
+                    }
+                ],
+            }
+        }
+        (config_dir / "settings.json").write_text(json.dumps(snippet), encoding="utf-8")
+        env = self.env()
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        res = subprocess.run([str(INSTALL)], cwd=ROOT, text=True, capture_output=True, env=env, timeout=20)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        settings = json.loads((config_dir / "settings.json").read_text(encoding="utf-8"))
+        expected = {
+            "UserPromptSubmit": ("$HOME/.claude/hooks/codex-fusion-userprompt.sh", "Codex Fusion: checking Codex..."),
+            "Stop": ("$HOME/.claude/hooks/codex-fusion-stop.sh", "Codex Fusion: reviewing changes..."),
+        }
+        for event, (command, status) in expected.items():
+            hooks = [
+                hook
+                for group in settings["hooks"][event]
+                for hook in group["hooks"]
+                if "codex-fusion" in hook["command"]
+            ]
+            self.assertEqual(len(hooks), 1)
+            self.assertEqual(hooks[0]["command"], command)
+            self.assertEqual(hooks[0]["timeout"], 270)
+            self.assertEqual(hooks[0]["statusMessage"], status)
+
+    def test_installer_skips_write_when_unchanged(self):
+        config_dir = self.base / "claude2"
+        env = self.env(CLAUDE_CONFIG_DIR=str(config_dir))
+        first = subprocess.run([str(INSTALL)], cwd=ROOT, text=True, capture_output=True, env=env, timeout=20)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        settings_path = config_dir / "settings.json"
+        before = settings_path.read_text(encoding="utf-8")
+        second = subprocess.run([str(INSTALL)], cwd=ROOT, text=True, capture_output=True, env=env, timeout=20)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("nothing to change", second.stdout)
+        self.assertEqual(settings_path.read_text(encoding="utf-8"), before)
+        self.assertEqual(list(config_dir.glob(".settings.*")), [])
+        self.assertEqual(list(config_dir.glob("*.codex-fusion.bak")), [])
 
     def test_installer_copies_common_hook_and_is_idempotent(self):
         config_dir = self.base / "claude"

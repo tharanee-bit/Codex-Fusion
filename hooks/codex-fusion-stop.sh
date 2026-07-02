@@ -42,13 +42,9 @@ case "$SESSION_ID" in *[!A-Za-z0-9._-]*|.|..) SESSION_ID="";; esac
 [ "$STOP_ACTIVE" = "true" ] && { cf_dbg "stop_hook_active -> exit"; exit 0; }
 [ -d "$CWD" ] || CWD="$PWD"
 
-if [ -n "$SESSION_ID" ]; then
-  STATE_KEY="session-$SESSION_ID"
-else
-  CWD_HASH="$(printf '%s' "$CWD" | git hash-object --stdin 2>/dev/null)"
-  STATE_KEY="cwd-${CWD_HASH:-unknown}"
-fi
+STATE_KEY="$(cf_state_key "$SESSION_ID" "$CWD")"
 BASELINE_FILE="$STATE_DIR/$STATE_KEY.baseline"
+HEAD_FILE="$STATE_DIR/$STATE_KEY.head"
 NO_REVIEW_FILE="$STATE_DIR/$STATE_KEY.no-review"
 REVIEWED_FILE="$STATE_DIR/$STATE_KEY.reviewed"
 SUBAGENTS_FILE="$STATE_DIR/$STATE_KEY.subagents"
@@ -57,21 +53,19 @@ FAILED_FILE="$STATE_DIR/$STATE_KEY.failed-review"
 [ -f "$NO_REVIEW_FILE" ] && { cf_dbg "no-review flag -> exit"; exit 0; }
 [ -f "$BASELINE_FILE" ] || { cf_dbg "no prompt baseline -> exit"; exit 0; }
 
+# Diff against the prompt-time HEAD, not the current one, so commits made during the turn stay in
+# the review surface. Unresolvable/missing SHA (pre-upgrade state, rebase, gc) falls back to HEAD:
+# fail-open toward reviewing, never toward skipping.
+BASE_SHA="$(cat "$HEAD_FILE" 2>/dev/null)"
+case "$BASE_SHA" in *[!0-9a-f]*) BASE_SHA="";; esac
+if [ -z "$BASE_SHA" ] || ! git -C "$CWD" rev-parse --verify --quiet "$BASE_SHA^{commit}" >/dev/null 2>&1; then
+  [ -n "$BASE_SHA" ] && cf_dbg "stored base sha unresolvable -> falling back to HEAD"
+  BASE_SHA="HEAD"
+fi
+
 CURRENT_FILE="$(mktemp 2>/dev/null)" || exit 0
 
-review_surface() {
-  git -C "$CWD" rev-parse --verify HEAD >/dev/null 2>&1 || return 1
-  printf '### tracked diff against HEAD\n'
-  git -C "$CWD" diff HEAD -- 2>/dev/null || return 1
-  printf '\n### untracked files\n'
-  git -C "$CWD" ls-files --others --exclude-standard -z 2>/dev/null |
-    while IFS= read -r -d '' f; do
-      printf '\n--- untracked file: %s ---\n' "$f"
-      git -C "$CWD" diff --no-index -- /dev/null "$CWD/$f" 2>/dev/null || true
-    done
-}
-
-review_surface >"$CURRENT_FILE" 2>/dev/null || { cf_dbg "current review surface unavailable -> exit"; exit 0; }
+cf_review_surface "$CWD" "$BASE_SHA" >"$CURRENT_FILE" 2>/dev/null || { cf_dbg "current review surface unavailable -> exit"; exit 0; }
 DIFF_HASH="$(git hash-object "$CURRENT_FILE" 2>/dev/null)"
 [ -n "$DIFF_HASH" ] || { cf_dbg "empty diff hash -> exit"; exit 0; }
 BASELINE_HASH="$(git hash-object "$BASELINE_FILE" 2>/dev/null)"
@@ -92,7 +86,7 @@ retry_exhausted() {
 }
 
 record_review_failure() {
-  mkdir -p -m 700 "$STATE_DIR" 2>/dev/null || return 0
+  cf_ensure_state_dir || return 0
   _old_hash=""
   _old_count=0
   [ -f "$FAILED_FILE" ] && read -r _old_hash _old_count <"$FAILED_FILE" 2>/dev/null
@@ -111,12 +105,12 @@ clear_review_failure() {
 
 retry_exhausted && { cf_dbg "review retry cap reached for unchanged diff"; exit 0; }
 
-DIFF="$(diff -u --label prompt-baseline --label current "$BASELINE_FILE" "$CURRENT_FILE" 2>/dev/null | head -c "$MAX_DIFF")"
+DIFF="$(cf_truncate_bytes "$(diff -u --label prompt-baseline --label current "$BASELINE_FILE" "$CURRENT_FILE" 2>/dev/null)" "$MAX_DIFF" "incremental diff")"
 [ -n "$DIFF" ] || { cf_dbg "empty incremental diff -> exit"; exit 0; }
-CHANGED="$(git -C "$CWD" status --short 2>/dev/null | head -c 3000)"
+CHANGED="$(cf_truncate_bytes "$(cf_filtered_status "$CWD")" 3000 "changed files")"
 
 store_reviewed() {
-  mkdir -p -m 700 "$STATE_DIR" 2>/dev/null && printf '%s\n' "$DIFF_HASH" >"$REVIEWED_FILE" 2>/dev/null
+  cf_ensure_state_dir && printf '%s\n' "$DIFF_HASH" >"$REVIEWED_FILE" 2>/dev/null
 }
 
 SUBAGENT_PREF="$(cat "$SUBAGENTS_FILE" 2>/dev/null)"
@@ -194,12 +188,19 @@ EOF
 }
 
 emit_block() {
-  REVIEW="$1" MAX_CHARS="$MAX_CHARS" "$PY" <<'PY'
+  # Shell-side cap BEFORE the env handoff: a single env string over ~128KiB fails execve (E2BIG),
+  # the python truncation would never run, and a review that found issues would be silently lost.
+  REVIEW="$(cf_truncate_bytes "$1" 100000 "codex review")" MAX_CHARS="$MAX_CHARS" "$PY" <<'PY'
 import os, json
 r = os.environ.get("REVIEW", "")
 try: m = int(os.environ.get("MAX_CHARS", "12000"))
 except Exception: m = 12000
-if len(r) > m: r = r[:m] + "\n\n[...truncated...]"
+if len(r) > m:
+    r = r[:m]
+    cut = r.rfind("\n")
+    if cut > 0:
+        r = r[:cut]
+    r += "\n\n[...review truncated at " + str(m) + " chars...]"
 reason = ("AUTOMATIC CODEX FUSION - POST-DIFF REVIEW:\n"
           "Codex independently reviewed your incremental changes and flagged potential issues. Address the "
           "serious problems (correctness, security, data-loss, concurrency, broken tests) before "

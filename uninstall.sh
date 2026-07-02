@@ -11,21 +11,24 @@ PY="$(command -v python3 || true)"
 
 if [ -f "$SETTINGS" ]; then
   CF_SETTINGS="$SETTINGS" "$PY" - <<'PY'
-import json, os, shutil, sys
-s = os.environ["CF_SETTINGS"]
+import json, os, shutil, sys, tempfile
+# realpath: keep a symlinked settings.json a symlink (atomic replace must land on the target).
+s = os.path.realpath(os.environ["CF_SETTINGS"])
 try:
     with open(s) as f:
         d = json.load(f)
 except Exception as e:
     print(f"WARNING: {s} is not valid JSON ({e}); leaving it untouched.", file=sys.stderr)
     sys.exit(0)
-shutil.copy2(s, s + ".codex-fusion.bak")
 hooks = d.get("hooks", {})
+removed = 0
 
 def strip(event):
+    global removed
     new = []
     for grp in hooks.get(event, []):
         kept = [h for h in grp.get("hooks", []) if "codex-fusion" not in (h.get("command") or "")]
+        removed += len(grp.get("hooks", [])) - len(kept)
         if kept:
             g = dict(grp); g["hooks"] = kept; new.append(g)
     if new:
@@ -38,9 +41,27 @@ for e in ("UserPromptSubmit", "Stop"):
 if not hooks and "hooks" in d:
     del d["hooks"]
 
-with open(s, "w") as f:
-    json.dump(d, f, indent=2)
-    f.write("\n")
+if removed == 0:
+    print("No Codex Fusion hook entries found; settings.json left untouched.")
+    sys.exit(0)
+
+# Back up, then swap atomically so an interrupted write can never leave settings.json truncated.
+shutil.copy2(s, s + ".codex-fusion.bak")
+d_name = os.path.dirname(s) or "."
+fd, tmp = tempfile.mkstemp(dir=d_name, prefix=".settings.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, s)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 print("Removed Codex Fusion hook entries from settings.json (backup: *.codex-fusion.bak)")
 PY
 fi
