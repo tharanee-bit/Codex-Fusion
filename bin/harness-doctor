@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""Read-only health check for the Codex Fusion <-> Claude Fusion peer-review harness.
+
+Verifies, without writing anything anywhere:
+  - hook registration in ~/.claude/settings.json and ~/.codex/hooks.json (exactly one per event)
+  - registered hook timeouts sit above the hooks' internal per-call timeouts
+  - installed hook/skill files exist, keep their exec bits, and are byte-identical to the repos
+  - the codex / claude binaries resolve and answer --version
+  - the installed claude supports --safe-mode (Claude Fusion fails closed without it)
+  - read-only invocation flags are still present in the installed scripts
+  - bash -n syntax, state-dir hygiene, recursion-guard pairing, config.toml hook-trust entries
+
+Usage: harness-doctor [--strict] [--skip-probes]
+Exit codes: 0 = no FAIL (WARNs allowed unless --strict), 1 = at least one FAIL, 2 = internal error.
+
+READ-ONLY GUARANTEE: this tool never creates directories, never writes or caches anything, and
+only runs provably read-only subprocesses (--version / --help probes, bash -n, git rev-parse).
+
+Env: honors CLAUDE_CONFIG_DIR, CODEX_HOME, TMPDIR like the installers/hooks, and CLAUDE_FUSION_REPO
+to locate the peer repo (default: a "Claude Fusion" directory next to this repo).
+"""
+
+import argparse
+import filecmp
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CF_SCRIPTS = ("codex-fusion-common.sh", "codex-fusion-userprompt.sh", "codex-fusion-stop.sh")
+CLF_SCRIPTS = ("claude-fusion-common.sh", "claude-fusion-userprompt.sh", "claude-fusion-stop.sh")
+# Mirrors the shell hooks' SAFE_MODE case patterns exactly (a value like "fAlSe" does NOT disable).
+SAFE_MODE_DISABLED = {"0", "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"}
+CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+CODEX_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+
+
+def norm(cmd):
+    # Same matching rule as install.sh: a "$HOME/..." snippet entry and the absolute path the
+    # installer registers must resolve to the same hook.
+    return os.path.normpath(os.path.expanduser(os.path.expandvars(cmd or "")))
+
+
+def positive_int(value, default):
+    s = str(value if value is not None else "").strip()
+    return int(s) if s.isdigit() and int(s) > 0 else default
+
+
+class Doctor:
+    def __init__(self, skip_probes=False):
+        self.skip_probes = skip_probes
+        self.results = []
+        self.claude_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+        self.codex_dir = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        self.own_repo = Path(__file__).resolve().parents[1]
+        self.peer_repo = Path(os.environ.get("CLAUDE_FUSION_REPO") or self.own_repo.parent / "Claude Fusion")
+        self.tmpdir = Path(os.environ.get("TMPDIR") or "/tmp")
+
+    def add(self, level, check, message):
+        self.results.append((level, check, message))
+
+    # --- read-only probes -------------------------------------------------------------------
+    def resolve_bin(self, name):
+        found = shutil.which(name)
+        if found:
+            return found
+        home = Path.home()
+        for cand in (home / ".local/bin" / name, home / "bin" / name,
+                     Path("/usr/local/bin") / name, home / ".npm-global/bin" / name):
+            if cand.is_file() and os.access(cand, os.X_OK):
+                return str(cand)
+        return None
+
+    @staticmethod
+    def probe(argv, timeout_s=10):
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
+                               stdin=subprocess.DEVNULL)
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+        except (OSError, subprocess.TimeoutExpired):
+            return None, ""
+
+    # --- shared checks ----------------------------------------------------------------------
+    def check_shared(self):
+        missing = [b for b in ("git", "timeout", "bash") if not shutil.which(b)]
+        if missing:
+            self.add("FAIL", "env.binaries", f"missing from PATH: {', '.join(missing)} (hooks silently skip)")
+        else:
+            self.add("PASS", "env.binaries", "git, timeout, bash resolve")
+
+        uid = os.getuid()
+        for side in ("codex", "claude"):
+            state = self.tmpdir / f"{side}-fusion-state-{uid}"
+            check = f"state.{side}-fusion"
+            if not state.exists():
+                self.add("PASS", check, f"{state} absent (created on first hook run)")
+            elif not state.is_dir():
+                self.add("WARN", check, f"{state} exists but is not a directory")
+            else:
+                st = state.stat()
+                mode = st.st_mode & 0o777
+                if st.st_uid != uid:
+                    self.add("WARN", check, f"{state} is owned by uid {st.st_uid}; hooks will refuse it")
+                elif mode != 0o700:
+                    self.add("WARN", check, f"{state} mode is {mode:o}, expected 700")
+                else:
+                    self.add("PASS", check, f"{state} owned, mode 700")
+
+        for flag in ("CLAUDE_FUSION_ACTIVE", "CODEX_FUSION_ACTIVE"):
+            if os.environ.get(flag) == "1":
+                self.add("WARN", "cross.env",
+                         f"{flag}=1 is exported in this shell -- every fusion hook launched from here silently skips")
+        overrides = sorted(
+            k for k in os.environ
+            if k.startswith(("CODEX_FUSION_", "CLAUDE_FUSION_"))
+            and k not in ("CLAUDE_FUSION_ACTIVE", "CODEX_FUSION_ACTIVE", "CLAUDE_FUSION_REPO")
+        )
+        if overrides:
+            self.add("INFO", "cross.env", "overrides set: " + ", ".join(overrides))
+
+        rc, _ = self.probe(["git", "rev-parse", "--is-inside-work-tree"], 5)
+        if rc != 0:
+            self.add("INFO", "cross.cwd",
+                     f"{os.getcwd()} is not a git repository -- Stop-hook diff review is disabled here")
+
+        for label, common in (("cf", self.claude_dir / "hooks" / CF_SCRIPTS[0]),
+                              ("clf", self.codex_dir / "hooks" / CLF_SCRIPTS[0])):
+            if not common.is_file():
+                continue  # reported by the per-direction file checks
+            text = common.read_text(encoding="utf-8", errors="replace")
+            if "CLAUDE_FUSION_ACTIVE" in text and "CODEX_FUSION_ACTIVE" in text:
+                self.add("PASS", "cross.recursion", f"{common.name} references both fusion-active flags")
+            else:
+                self.add("FAIL", "cross.recursion",
+                         f"{common} is missing a fusion-active flag -- claude<->codex hook loops are possible")
+
+    # --- per-direction helpers --------------------------------------------------------------
+    @staticmethod
+    def fusion_entries(container, event, target):
+        found = []
+        for grp in container.get(event, []) or []:
+            if not isinstance(grp, dict):
+                continue
+            for h in grp.get("hooks", []) or []:
+                if isinstance(h, dict) and norm(h.get("command")) == norm(str(target)):
+                    found.append(h)
+        return found
+
+    def check_registration(self, prefix, container, event, target, internal_timeout, config_name):
+        key = "userprompt" if event == "UserPromptSubmit" else "stop"
+        entries = self.fusion_entries(container, event, target)
+        if not entries:
+            self.add("FAIL", f"{prefix}.hooks.{key}", f"not registered in {config_name} -- re-run install.sh")
+            return
+        if len(entries) > 1:
+            self.add("WARN", f"{prefix}.hooks.{key}", f"registered {len(entries)} times in {config_name} (duplicate)")
+        else:
+            self.add("PASS", f"{prefix}.hooks.{key}", f"registered once in {config_name}")
+        for h in entries:
+            timeout = h.get("timeout")
+            if not isinstance(timeout, (int, float)) or timeout <= internal_timeout:
+                self.add("FAIL", f"{prefix}.hooks.timeout",
+                         f"{event} registration timeout {timeout!r} must exceed the internal "
+                         f"per-call timeout {internal_timeout}s or consults get killed mid-flight")
+            else:
+                self.add("PASS", f"{prefix}.hooks.timeout", f"{event} {int(timeout)}s > internal {internal_timeout}s")
+
+    def check_files(self, prefix, hooks_dir, repo_hooks_dir, scripts, repo_known):
+        missing = [s for s in scripts if not (hooks_dir / s).is_file()]
+        if missing:
+            self.add("FAIL", f"{prefix}.files.installed", f"missing under {hooks_dir}: {', '.join(missing)}")
+        else:
+            no_exec = [s for s in scripts[1:] if not os.access(hooks_dir / s, os.X_OK)]
+            if no_exec:
+                self.add("FAIL", f"{prefix}.files.installed", f"not executable: {', '.join(no_exec)}")
+            else:
+                self.add("PASS", f"{prefix}.files.installed", f"all present under {hooks_dir}, exec bits intact")
+        if not repo_known:
+            self.add("INFO", f"{prefix}.files.parity", "peer repo not found; parity check skipped")
+            return
+        drifted = [s for s in scripts
+                   if (hooks_dir / s).is_file() and (repo_hooks_dir / s).is_file()
+                   and not filecmp.cmp(hooks_dir / s, repo_hooks_dir / s, shallow=False)]
+        uncomparable = [s for s in scripts if not (repo_hooks_dir / s).is_file()]
+        if drifted:
+            self.add("FAIL", f"{prefix}.files.parity", f"differ from repo: {', '.join(drifted)} -- re-run install.sh")
+        elif uncomparable:
+            self.add("WARN", f"{prefix}.files.parity", f"missing in repo: {', '.join(uncomparable)}")
+        elif not missing:
+            self.add("PASS", f"{prefix}.files.parity", "installed hooks byte-identical to repo")
+
+    def check_skill(self, prefix, installed, repo_skill, repo_known):
+        if not installed.is_file():
+            self.add("WARN", f"{prefix}.skill", f"{installed} missing -- re-run install.sh")
+        elif repo_known and repo_skill.is_file() and not filecmp.cmp(installed, repo_skill, shallow=False):
+            self.add("WARN", f"{prefix}.skill", f"{installed} differs from repo")
+        else:
+            self.add("PASS", f"{prefix}.skill", f"{installed.parent.name}/SKILL.md installed")
+
+    def check_flags(self, prefix, common_path, required):
+        if not common_path.is_file():
+            return
+        text = common_path.read_text(encoding="utf-8", errors="replace")
+        lost = [f for f in required if f not in text]
+        if lost:
+            self.add("FAIL", f"{prefix}.flags.readonly",
+                     f"{common_path.name} lost required flag(s): {', '.join(lost)}")
+        else:
+            self.add("PASS", f"{prefix}.flags.readonly", "read-only invocation flags present: " + ", ".join(required))
+
+    def check_syntax(self, prefix, hooks_dir, scripts):
+        if self.skip_probes:
+            self.add("INFO", f"{prefix}.syntax", "skipped (--skip-probes)")
+            return
+        bad = []
+        for s in scripts:
+            path = hooks_dir / s
+            if path.is_file():
+                rc, out = self.probe(["bash", "-n", str(path)], 10)
+                if rc != 0:
+                    bad.append(f"{s}: {out.strip().splitlines()[-1] if out.strip() else 'rc=' + str(rc)}")
+        if bad:
+            self.add("FAIL", f"{prefix}.syntax", "; ".join(bad))
+        else:
+            self.add("PASS", f"{prefix}.syntax", "bash -n clean on installed scripts")
+
+    def check_binary(self, prefix, name):
+        path = self.resolve_bin(name)
+        check = f"{prefix}.bin.{name}"
+        if not path:
+            self.add("FAIL", check, f"'{name}' not found on PATH or in the hooks' fallback dirs -- hooks silently skip")
+            return None
+        if self.skip_probes:
+            self.add("INFO", check, f"{path} (version probe skipped)")
+            return path
+        rc, out = self.probe([path, "--version"], 10)
+        first = out.strip().splitlines()[0] if out.strip() else ""
+        if rc == 0:
+            self.add("PASS", check, f"{path} ({first})" if first else path)
+        else:
+            self.add("WARN", check, f"{path} failed --version (rc={rc})")
+        return path
+
+    # --- Codex Fusion direction (Claude Code side) --------------------------------------------
+    def check_cf(self):
+        hooks_dir = self.claude_dir / "hooks"
+        settings_path = self.claude_dir / "settings.json"
+        installed = any((hooks_dir / s).exists() for s in CF_SCRIPTS)
+        if not installed and not settings_path.exists():
+            self.add("INFO", "cf", f"Codex Fusion not installed under {self.claude_dir}; direction skipped")
+            return
+
+        internal = positive_int(os.environ.get("CODEX_FUSION_TIMEOUT"), 180)
+        container = {}
+        if not settings_path.exists():
+            self.add("FAIL", "cf.settings.parse", f"{settings_path} missing -- hooks cannot be registered")
+        else:
+            try:
+                data = json.loads(settings_path.read_text(encoding="utf-8"))
+                container = data.get("hooks", {}) if isinstance(data, dict) else {}
+                self.add("PASS", "cf.settings.parse", f"{settings_path} is valid JSON")
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                self.add("FAIL", "cf.settings.parse", f"{settings_path} is not valid JSON ({e})")
+        self.check_registration("cf", container, "UserPromptSubmit",
+                                hooks_dir / "codex-fusion-userprompt.sh", internal, "settings.json")
+        self.check_registration("cf", container, "Stop",
+                                hooks_dir / "codex-fusion-stop.sh", internal, "settings.json")
+
+        self.check_files("cf", hooks_dir, self.own_repo / "hooks", CF_SCRIPTS, True)
+        self.check_skill("cf", self.claude_dir / "skills/codex-fusion-auto/SKILL.md",
+                         self.own_repo / "skills/codex-fusion-auto/SKILL.md", True)
+        self.check_flags("cf", hooks_dir / CF_SCRIPTS[0], ("--sandbox read-only", "--ask-for-approval never"))
+        self.check_syntax("cf", hooks_dir, CF_SCRIPTS)
+        self.check_binary("cf", "codex")
+
+        model = os.environ.get("CODEX_FUSION_MODEL", "gpt-5.5")
+        effort = os.environ.get("CODEX_FUSION_EFFORT", "xhigh")
+        if os.environ.get("CODEX_FUSION_EFFORT") and effort not in CODEX_EFFORTS:
+            self.add("WARN", "cf.config", f"CODEX_FUSION_EFFORT={effort!r} is not a known codex effort "
+                                          f"({'/'.join(sorted(CODEX_EFFORTS))}); consults may fall back or fail")
+        else:
+            self.add("INFO", "cf.config", f"codex model={model} effort={effort} timeout={internal}s")
+
+    # --- Claude Fusion direction (Codex side) --------------------------------------------------
+    def check_clf(self):
+        hooks_dir = self.codex_dir / "hooks"
+        hooks_json = self.codex_dir / "hooks.json"
+        installed = any((hooks_dir / s).exists() for s in CLF_SCRIPTS)
+        if not installed and not hooks_json.exists():
+            self.add("INFO", "clf", f"Claude Fusion not installed under {self.codex_dir}; direction skipped")
+            return
+        repo_known = self.peer_repo.is_dir()
+        if not repo_known:
+            self.add("INFO", "cross.peer", f"Claude Fusion repo not found at {self.peer_repo} "
+                                           "(set CLAUDE_FUSION_REPO); parity checks skipped")
+
+        depth = os.environ.get("CLAUDE_FUSION_DEPTH", "workflow")
+        internal = positive_int(os.environ.get("CLAUDE_FUSION_TIMEOUT"), 600 if depth == "workflow" else 300)
+        container = {}
+        if not hooks_json.exists():
+            self.add("FAIL", "clf.hooks.parse", f"{hooks_json} missing -- hooks cannot be registered")
+        else:
+            try:
+                data = json.loads(hooks_json.read_text(encoding="utf-8"))
+                # install.sh accepts both the wrapped {"hooks": {...}} form and bare event keys.
+                container = data.get("hooks", data) if isinstance(data, dict) else {}
+                self.add("PASS", "clf.hooks.parse", f"{hooks_json} is valid JSON")
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                self.add("FAIL", "clf.hooks.parse", f"{hooks_json} is not valid JSON ({e})")
+        self.check_registration("clf", container, "UserPromptSubmit",
+                                hooks_dir / "claude-fusion-userprompt.sh", internal, "hooks.json")
+        self.check_registration("clf", container, "Stop",
+                                hooks_dir / "claude-fusion-stop.sh", internal, "hooks.json")
+
+        self.check_files("clf", hooks_dir, self.peer_repo / "hooks", CLF_SCRIPTS, repo_known)
+        self.check_skill("clf", self.codex_dir / "skills/claude-fusion-auto/SKILL.md",
+                         self.peer_repo / "skills/claude-fusion-auto/SKILL.md", repo_known)
+        self.check_flags("clf", hooks_dir / CLF_SCRIPTS[0], ("--permission-mode plan", "--no-session-persistence"))
+        self.check_syntax("clf", hooks_dir, CLF_SCRIPTS)
+        claude_bin = self.check_binary("clf", "claude")
+        self.check_safe_mode(claude_bin)
+        self.check_trust(hooks_json)
+
+        model = os.environ.get("CLAUDE_FUSION_MODEL", "opus")
+        effort = os.environ.get("CLAUDE_FUSION_EFFORT", "xhigh")
+        if os.environ.get("CLAUDE_FUSION_EFFORT") and effort not in CLAUDE_EFFORTS:
+            self.add("WARN", "clf.config", f"CLAUDE_FUSION_EFFORT={effort!r} is not a known claude effort "
+                                           f"({'/'.join(sorted(CLAUDE_EFFORTS))}); consults may fall back or fail")
+        else:
+            self.add("INFO", "clf.config", f"claude model={model} effort={effort} depth={depth} timeout={internal}s")
+
+    def check_safe_mode(self, claude_bin):
+        safe_mode_on = os.environ.get("CLAUDE_FUSION_SAFE_MODE", "1") not in SAFE_MODE_DISABLED
+        if not safe_mode_on:
+            self.add("WARN", "clf.safemode",
+                     "safe mode disabled via CLAUDE_FUSION_SAFE_MODE -- automatic consults load local "
+                     "Claude customizations (CLAUDE.md, memory, skills, MCP)")
+            return
+        if self.skip_probes:
+            self.add("INFO", "clf.safemode", "probe skipped (--skip-probes)")
+            return
+        if not claude_bin:
+            return  # already a FAIL from clf.bin.claude
+        rc, out = self.probe([claude_bin, "--help"], 15)
+        if "--safe-mode" in out:
+            self.add("PASS", "clf.safemode", "installed claude supports --safe-mode")
+        elif not out.strip():
+            self.add("WARN", "clf.safemode", f"could not probe {claude_bin} --help (rc={rc}); "
+                                             "if it lacks --safe-mode every consult silently skips")
+        else:
+            self.add("FAIL", "clf.safemode",
+                     "installed claude lacks --safe-mode, so every Claude Fusion consult silently skips "
+                     "(fail-closed) -- update Claude Code or set CLAUDE_FUSION_SAFE_MODE=0")
+
+    def check_trust(self, hooks_json):
+        try:
+            import tomllib
+        except ImportError:
+            self.add("WARN", "clf.trust", "tomllib unavailable (python < 3.11); config.toml checks skipped")
+            return
+        config = self.codex_dir / "config.toml"
+        if not config.is_file():
+            self.add("WARN", "clf.trust", f"{config} not found; cannot confirm the hooks are trusted")
+            return
+        try:
+            data = tomllib.loads(config.read_text(encoding="utf-8"))
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+            self.add("WARN", "clf.trust", f"{config} failed to parse ({e})")
+            return
+        hooks_tbl = data.get("hooks", {}) if isinstance(data.get("hooks"), dict) else {}
+        extra = [k for k in hooks_tbl if k != "state"]
+        if extra:
+            self.add("WARN", "clf.trust",
+                     f"config.toml [hooks] also defines {', '.join(extra)} -- double registration "
+                     "risk alongside hooks.json")
+        state = hooks_tbl.get("state", {}) if isinstance(hooks_tbl.get("state"), dict) else {}
+        paths = {str(hooks_json), os.path.realpath(hooks_json)}
+        missing = [frag for frag in ("user_prompt_submit", "stop")
+                   if not any(f":{frag}:" in k and any(k.startswith(p + ":") for p in paths) for k in state)]
+        if missing:
+            self.add("WARN", "clf.trust",
+                     f"no [hooks.state] trust entry for: {', '.join(missing)} -- run /hooks in Codex and "
+                     "trust the Claude Fusion hooks or they will not fire")
+        else:
+            self.add("PASS", "clf.trust",
+                     "both hooks have trust entries (note: editing hooks.json entries requires re-trusting via /hooks)")
+
+    # --- reporting ---------------------------------------------------------------------------
+    def report(self, strict=False):
+        width = max((len(check) for _, check, _ in self.results), default=0)
+        for level, check, message in self.results:
+            print(f"{level:<5} {check:<{width}}  {message}")
+        counts = {lvl: sum(1 for r in self.results if r[0] == lvl) for lvl in ("PASS", "WARN", "FAIL")}
+        print(f"harness-doctor: {counts['PASS']} pass, {counts['WARN']} warn, {counts['FAIL']} fail")
+        if counts["FAIL"]:
+            return 1
+        if strict and counts["WARN"]:
+            return 1
+        return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="harness-doctor",
+        description="Read-only health check for the Codex Fusion <-> Claude Fusion harness.")
+    parser.add_argument("--strict", action="store_true", help="exit 1 on WARN as well as FAIL")
+    parser.add_argument("--skip-probes", action="store_true",
+                        help="skip subprocess probes (--version/--help/bash -n) for a fast pass")
+    args = parser.parse_args(argv)
+
+    doctor = Doctor(skip_probes=args.skip_probes)
+    doctor.check_shared()
+    doctor.check_cf()
+    doctor.check_clf()
+    return doctor.report(strict=args.strict)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(2)

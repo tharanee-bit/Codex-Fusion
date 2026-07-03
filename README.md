@@ -195,6 +195,25 @@ echo '{"prompt":"Refactor the auth module to fix a race condition","cwd":"'"$PWD
   | CODEX_FUSION_DEBUG=1 ~/.claude/hooks/codex-fusion-userprompt.sh
 ```
 
+## Health check
+
+```bash
+./bin/harness-doctor              # full check; add --strict to fail on warnings, --skip-probes for a fast pass
+```
+
+A read-only doctor for the whole harness — it verifies **both** directions when Claude Fusion is
+also installed (auto-detected as a sibling `Claude Fusion` checkout; override with
+`CLAUDE_FUSION_REPO`). It checks hook registration (exactly one `UserPromptSubmit` + one `Stop`
+per side), registered-vs-internal timeout headroom, installed-file parity against the repos, exec
+bits, `bash -n` syntax, binary availability, the read-only invocation flags, `--safe-mode` support
+on the installed `claude` (without it every Claude Fusion consult silently skips), state-dir
+hygiene, recursion-guard pairing, and `config.toml` hook-trust entries. It never writes anything.
+Exit 0 = healthy, 1 = at least one FAIL.
+
+The most valuable time to run it: after updating Claude Code / Codex, after editing either repo,
+or whenever the harness feels quiet — most failure modes here are silent by design (the hooks
+guarantee they never block), so this is the tool that makes them visible.
+
 ## Uninstall
 
 ```bash
@@ -211,6 +230,7 @@ hooks/codex-fusion-common.sh       # shared Codex runner, fanout gates, and help
 hooks/codex-fusion-userprompt.sh   # UserPromptSubmit hook (pre-edit analysis)
 hooks/codex-fusion-stop.sh         # Stop hook (post-diff review)
 skills/codex-fusion-auto/SKILL.md  # how Claude synthesizes Claude + Codex
+bin/harness-doctor                 # read-only health check for both Fusion directions
 settings.snippet.json              # hooks block to merge (manual install)
 install.sh / uninstall.sh          # idempotent installer / remover
 ```
