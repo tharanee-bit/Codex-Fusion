@@ -52,8 +52,8 @@ if not isinstance(data, dict):
 
 hooks = data.setdefault("hooks", {})
 
-# Hook registration timeout. Keep in sync with settings.snippet.json and comfortably above the
-# hooks' internal CODEX_TIMEOUT (180s by default) so xhigh Codex calls finish instead of being killed.
+# Hook registration timeout. Keep in sync with settings.snippet.json and above the hooks' whole-run
+# CODEX_FUSION_BUDGET (250s by default) includes call timeout, 5s hard-kill grace, and result processing.
 HOOK_TIMEOUT = 270
 USERPROMPT_STATUS = "Codex Fusion: checking Codex..."
 STOP_STATUS = "Codex Fusion: reviewing changes..."
