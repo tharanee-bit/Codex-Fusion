@@ -33,6 +33,21 @@ every serious issue (correctness, security, data-loss, concurrency, broken tests
 or explicitly justify why each is not a real problem. Treat stronger evidence as more important
 than the number of agents that reported it.
 
+## Subagent adversarial verification (SubagentStop hook)
+If you are running **as a subagent** and a **SUBAGENT ADVERSARIAL VERIFICATION** message appears,
+Codex has independently checked your final report against the repository and found concrete
+counter-evidence. Before returning to your parent agent:
+1. Re-check each flagged claim **against the repository**, not against your memory of what you did.
+2. Fix what is genuinely wrong, and correct or withdraw any claim you cannot support. Silently
+   dropping an overstated claim is better than defending it.
+3. Where Codex is wrong, say so explicitly and cite the evidence that refutes it.
+4. Never restate a "done" / "tests pass" / "verified" claim you have not actually confirmed — that
+   specific failure is what this check exists to catch.
+
+If you are the **parent** agent, treat a verified subagent report as checked but not proven: the
+verifier saw the report and the diff, not the subagent's full reasoning. Independently confirm any
+subagent claim you are about to build on.
+
 ## Required final summary
 End your response with a short **Codex Fusion summary**:
 - Whether Codex was consulted automatically.

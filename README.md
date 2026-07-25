@@ -15,9 +15,16 @@ It uses Claude Code **hooks**:
   **read-only** over the incremental tracked/untracked review surface. Larger or high-risk diffs can
   fan out to `correctness`, `security-data-loss-concurrency`, and `tests-regression` reviewers. If
   any reviewer flags serious problems, Claude is asked to address them before finalizing.
+- **When a Claude Code subagent finishes**, a `SubagentStop` hook runs Codex **read-only** as an
+  *adversarial verifier* of that subagent's final report — before the report reaches its parent.
+  Codex is told to assume the report may be wrong and to try to refute it against the repository:
+  fabricated paths or APIs, claims contradicted by the code, unsupported "done / tests pass"
+  assertions, work the report claims but never made, and serious defects in changes the subagent
+  did make. If Codex finds concrete evidence of a problem, the subagent is blocked and must fix or
+  refute the findings first.
 
-Claude stays the editor and the final judge. Codex only advises and reviews — it is always
-**read-only** and never edits your files.
+Claude stays the editor and the final judge. Codex only advises, reviews, and verifies — it is
+always **read-only** and never edits your files.
 
 > **No credential games.** Codex Fusion shells out to the official `codex exec` CLI that you are
 > already logged into. It does **not** use browser cookies, ChatGPT scraping, private APIs, token
@@ -41,6 +48,18 @@ Claude stays the editor and the final judge. Codex only advises and reviews — 
         ▼
    Claude synthesizes Claude + Codex, then edits
         │
+        ├───────────────── Claude spawns a subagent ─────────────────┐
+        │                                                            ▼
+        │                                        SubagentStop hook ── [no-codex] / trivial
+        │                                                │           report + clean tree? ──▶ (silent)
+        │                                                ▼ no
+        │                                        codex exec --sandbox read-only
+        │                                        adversarial verifier over the
+        │                                        subagent's report + the diff
+        │                                                │
+        │                                        ├─ PASS         ──▶ report goes to the parent
+        │                                        └─ ISSUES_FOUND ──▶ subagent must fix/refute first
+        │                                                            (bounded blocks per subagent)
         ▼
    Stop hook ── changes since prompt baseline? ──no──▶ (Claude finishes)
         │ yes
@@ -60,16 +79,33 @@ made mid-turn still get reviewed, and an unchanged already-reviewed surface does
 again on every later Stop. If a Stop review path fails transiently, the unchanged diff is retried a
 bounded number of times and then skipped until the diff changes.
 
+Subagent verification uses that same prompt-start baseline, but **all of its state is keyed by
+`agent_id`**, never by the session alone. Two consequences matter:
+
+- Parallel subagents cannot race or clobber each other's verification state.
+- A subagent verification **never** marks the parent turn's diff as reviewed, so the final `Stop`
+  review of the whole turn still runs. (This is a real trap: reusing the Stop hook's reviewed-diff
+  hash here would silently suppress the end-of-turn review.)
+
+Each subagent costs at most one Codex call per distinct *(report + diff)* pair. A subagent that stops
+again having changed nothing does not pay for a second identical Codex run — but it does not slip
+through either: the blocking verdict is cached and replayed, so an unfixed report keeps blocking up
+to `CODEX_FUSION_SUBAGENT_BLOCK_LIMIT` times. At that cap the remaining findings are surfaced to you
+as a `systemMessage` rather than silently dropped. Per-agent state is cleared at the start of every
+new turn.
+
 If the working directory is not a git repository (for example a folder that merely contains
 repositories), the Stop diff review cannot run; Codex Fusion tells you so once per session via a
 visible `systemMessage` instead of failing silently. Open a concrete repository folder to get the
-post-diff review back.
+post-diff review back. Subagent verification still runs without a diff — verifying a read-only
+subagent's *claims* is worthwhile even when nothing changed on disk.
 
 Claude Code also shows a live hook status message while Codex Fusion runs. After a successful
 pre-prompt consult, Codex Fusion emits a human-facing `systemMessage`; fanout notices include the
 actual spawned sub-agent count and how many returned usable output. Fanout Stop reviews emit the
 same count when they block on `ISSUES_FOUND`, and emit a PASS notice when all spawned review agents
-pass.
+pass. Subagent verification emits its own notice naming the verified agent type, for example
+`Codex Fusion: Explore subagent adversarially verified (PASS).`
 
 ## Requirements
 
@@ -78,7 +114,8 @@ pass.
 - **python3**, **git**, **bash**, and GNU coreutils (`timeout`, `mktemp`, `base64`).
   `jq` is *not* required — JSON is handled with python3.
 
-Tested on Linux / WSL2.
+Tested on Linux / WSL2 and macOS. The hooks stay compatible with bash 3.2, which is what
+`#!/usr/bin/env bash` resolves to on a stock macOS.
 
 ## Install
 
@@ -88,13 +125,16 @@ cd Codex-Fusion
 ./install.sh
 ```
 
-`install.sh` copies the hook scripts and skill into `~/.claude/` and **merges** the two hooks into
+`install.sh` copies the hook scripts and skill into `~/.claude/` and **merges** the three hooks into
 `~/.claude/settings.json` non-destructively (it backs the file up to
 `settings.json.codex-fusion.bak` first, and is idempotent — re-running won't duplicate entries).
 It respects `CLAUDE_CONFIG_DIR` if you set it.
 
 New hooks load at session start, so **restart Claude Code / reload the window**, then run `/hooks`
-to confirm `UserPromptSubmit` and `Stop` list the Codex Fusion scripts.
+to confirm `UserPromptSubmit`, `Stop`, and `SubagentStop` list the Codex Fusion scripts. The
+`SubagentStop` entry is registered without a matcher, so it covers every subagent type including
+custom and plugin-scoped ones. If your Claude Code build is too old to show `SubagentStop`, upgrade
+it — the other two hooks keep working either way.
 
 ### Manual install
 
@@ -112,9 +152,12 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | `CODEX_FUSION_MODEL` | `gpt-5.5` | Codex model to use. Defaults to the strongest available model. |
 | `CODEX_FUSION_EFFORT` | `xhigh` | Codex reasoning effort (`low` / `medium` / `high` / `xhigh`). Defaults to extra-high. |
 | `CODEX_FUSION_SUBAGENTS` | `auto` | Sub-agent policy: `auto`, `off`, or `always`. Prompt markers still select per-turn behavior. |
+| `CODEX_FUSION_SUBAGENT_VERIFY` | `auto` | Adversarial verification of Claude Code subagents: `auto`, `off`, or `always`. `off` disables the `SubagentStop` Codex call entirely. |
+| `CODEX_FUSION_SUBAGENT_MIN_CHARS` | `200` | In `auto` mode, a subagent whose tree is unchanged is verified only when its report is at least this many bytes. A subagent that touched the tree is always verified. |
+| `CODEX_FUSION_SUBAGENT_BLOCK_LIMIT` | `2` | Maximum times one subagent can be blocked by verification. At the cap, findings are surfaced as a `systemMessage` instead. |
 | `CODEX_FUSION_MAX_AGENTS` | `4` | Hard cap for hook-launched Codex agents and any bounded internal delegation contract. |
 | `CODEX_FUSION_TIMEOUT` | `180` | Per-agent timeout in seconds. The Claude hook registration timeout remains 270s. |
-| `CODEX_FUSION_STOP_RETRY_LIMIT` | `2` | Number of transient failed Stop review attempts for an unchanged diff before skipping. |
+| `CODEX_FUSION_STOP_RETRY_LIMIT` | `2` | Number of transient failed Stop review / subagent verification attempts for unchanged input before skipping. |
 | `CODEX_FUSION_NOTIFY` | `1` | Set to `0` to suppress human-facing success `systemMessage` notices. Context injection, blocking review reasons, and the non-git-repo warning still work. |
 | `CODEX_FUSION_EXCLUDE` | — | Extra space-separated globs to exclude from every review surface, on top of the built-in sensitive-path denylist (globs containing spaces are unsupported). |
 | `CODEX_FUSION_MAX_FILE_BYTES` | `204800` | Per-file size cap for untracked files embedded in the review surface; larger files appear as an exclusion marker only. |
@@ -133,6 +176,13 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 > text is sent through your logged-in Codex CLI. To trade quality for speed, set
 > `CODEX_FUSION_SUBAGENTS=off`, set `CODEX_FUSION_EFFORT=high` (or `medium` / `low`), or use
 > `[no-codex]` / `[no-subagents]` for a given prompt.
+>
+> **Subagent verification is the most expensive knob.** A `SubagentStop` fires once per subagent, so a
+> turn where Claude fans out to 8 subagents costs up to 8 additional Codex calls, running concurrently
+> as those subagents finish. That is why verification defaults to **one** Codex agent per subagent
+> rather than a fanout — it only splits into `subagent-claim-verification` + `subagent-defect-hunt`
+> when you pass `[subagents]` or set `CODEX_FUSION_SUBAGENTS=always`. Set
+> `CODEX_FUSION_SUBAGENT_VERIFY=off` to turn the whole layer off.
 
 ### The trigger gate
 
@@ -140,6 +190,12 @@ The `UserPromptSubmit` hook uses a **near-universal** gate: it consults Codex on
 prompt except explicit `[no-codex]`, pure acknowledgements/greetings like `ok` or `thanks`, nested
 Fusion subprocesses, or missing/failed dependencies. Typos, renames, formatting requests, comments,
 short questions, and two-word prompts all trigger Codex.
+
+The `SubagentStop` gate is deliberately near-universal too. A subagent that changed the working tree
+is **always** verified. A subagent that only reported (an `Explore` or research agent, say) is
+verified whenever its report is at least `CODEX_FUSION_SUBAGENT_MIN_CHARS` bytes — a one-word "ok"
+on an unchanged tree is not worth a Codex call. `[no-codex]` on the turn's prompt, `stop_hook_active`,
+nested Fusion subprocesses, and `CODEX_FUSION_SUBAGENT_VERIFY=off` all skip it.
 
 Sub-agent fanout is automatic by default but bounded. Pre-prompt fanout runs when forced by marker,
 when `CODEX_FUSION_SUBAGENTS=always`, or when a simple score sees enough breadth/risk signals such
@@ -164,6 +220,18 @@ finishes, for example: `Codex Fusion: spawned 3 sub-agents; 3/3 succeeded.`
   Codex not to inspect credentials, but the guarantee is the source-level exclusion, not that
   instruction. Known limit: the filter is path-based, so if a turn renames a secret file to a
   non-denylisted name, the content appears in the diff under its new name.
+- **Subagent reports are redacted, not path-filtered.** A subagent's final message is free-form model
+  text, so the path denylist cannot protect it. Before that text reaches Codex it is run through a
+  secret-shaped-value redactor (private-key blocks, AWS key ids, GitHub / Slack / Google /
+  OpenAI-style tokens, JWTs, `Authorization:` headers, and `key|secret|token|password = …`
+  assignments). Redaction runs **before** truncation, and an unterminated `BEGIN … PRIVATE KEY`
+  block is redacted through end-of-text: cutting a key block above its `END` marker would otherwise
+  strand the key body somewhere no paired pattern matches. Known limit: this is pattern-based and
+  best-effort — a secret in an unusual shape can still get through. The hook reads only
+  `last_assistant_message`; it never opens `transcript_path` or `agent_transcript_path`.
+- The subagent report is handed to Codex inside explicit untrusted-data delimiters, with an
+  instruction to treat it strictly as a claim to verify and never as instructions to follow — it is
+  model-generated text and therefore a prompt-injection surface.
 - State lives in a per-user, mode-0700 directory whose ownership is verified before every use, so a
   hostile co-tenant on shared `/tmp` cannot pre-create or poison it.
 - Hook-launched sub-agents are separate read-only `codex exec` subprocesses with separate output
@@ -173,6 +241,10 @@ finishes, for example: `Codex Fusion: spawned 3 sub-agents; 3/3 succeeded.`
 - The `Stop` hook only ever forces Claude to continue (`decision: block`) when Codex explicitly
   returns `CODEX_REVIEW_VERDICT: ISSUES_FOUND`, and it is loop-safe via `stop_hook_active` plus a
   prompt baseline, reviewed-diff hash, and bounded failed-review retry counter.
+- The `SubagentStop` hook only blocks on an explicit `CODEX_VERIFY_VERDICT: ISSUES_FOUND`, and Codex
+  is told that failing to *confirm* a claim is not grounds for `ISSUES_FOUND`. It is loop-safe via
+  `stop_hook_active`, a per-agent verified-payload hash, a bounded retry counter, and a hard
+  per-subagent block cap.
 - Internal `timeout` keeps each Codex call bounded; injected output is truncated.
 
 ## Test it
@@ -195,24 +267,42 @@ echo '{"prompt":"Refactor the auth module to fix a race condition","cwd":"'"$PWD
   | CODEX_FUSION_DEBUG=1 ~/.claude/hooks/codex-fusion-userprompt.sh
 ```
 
+Subagent verification needs the baseline from that first call, then replays a subagent's report:
+
+```bash
+echo '{"cwd":"'"$PWD"'","session_id":"t1","stop_hook_active":false,"agent_id":"a1",
+       "agent_type":"general-purpose",
+       "last_assistant_message":"Done. I removed the retry loop in client.py and all tests pass."}' \
+  | CODEX_FUSION_DEBUG=1 ~/.claude/hooks/codex-fusion-subagent-stop.sh
+```
+
+The repo's own test suite runs without Codex installed (it uses a fake `codex` shim):
+
+```bash
+python3 -m unittest tests.test_hooks
+```
+
 ## Uninstall
 
 ```bash
 ./uninstall.sh
 ```
 
-Removes the two hook entries from `settings.json` (leaving a `*.codex-fusion.bak` backup) and
-deletes the installed hook scripts and skill. Your other hooks and settings are untouched.
+Removes the three hook entries from `settings.json` (leaving a `*.codex-fusion.bak` backup) and
+deletes the installed hook scripts and skill. Your other hooks and settings are untouched, including
+unrelated `SubagentStop` hooks of your own.
 
 ## Layout
 
 ```
-hooks/codex-fusion-common.sh       # shared Codex runner, fanout gates, and helpers
-hooks/codex-fusion-userprompt.sh   # UserPromptSubmit hook (pre-edit analysis)
-hooks/codex-fusion-stop.sh         # Stop hook (post-diff review)
-skills/codex-fusion-auto/SKILL.md  # how Claude synthesizes Claude + Codex
-settings.snippet.json              # hooks block to merge (manual install)
-install.sh / uninstall.sh          # idempotent installer / remover
+hooks/codex-fusion-common.sh         # shared Codex runner, fanout gates, and helpers
+hooks/codex-fusion-userprompt.sh     # UserPromptSubmit hook (pre-edit analysis)
+hooks/codex-fusion-stop.sh           # Stop hook (post-diff review)
+hooks/codex-fusion-subagent-stop.sh  # SubagentStop hook (adversarial subagent verification)
+skills/codex-fusion-auto/SKILL.md    # how Claude synthesizes Claude + Codex
+settings.snippet.json                # hooks block to merge (manual install)
+install.sh / uninstall.sh            # idempotent installer / remover
+tests/test_hooks.py                  # end-to-end hook tests against a fake codex CLI
 ```
 
 ## License

@@ -23,6 +23,18 @@
           }
         ]
       }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/codex-fusion-subagent-stop.sh",
+            "timeout": 270,
+            "statusMessage": "Codex Fusion: verifying subagent..."
+          }
+        ]
+      }
     ]
   }
 }

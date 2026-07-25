@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Codex Fusion installer.
-# Copies the hook scripts + skill into ~/.claude and merges the UserPromptSubmit + Stop
-# hooks into ~/.claude/settings.json non-destructively and idempotently.
+# Copies the hook scripts + skill into ~/.claude and merges the UserPromptSubmit + Stop +
+# SubagentStop hooks into ~/.claude/settings.json non-destructively and idempotently.
 # Honors CLAUDE_CONFIG_DIR. Requires python3 (used to safely edit settings.json).
 set -euo pipefail
 
@@ -23,18 +23,20 @@ mkdir -p "$HOOKS_DIR" "$SKILLS_DIR/codex-fusion-auto"
 install -m 0644 "$HERE/hooks/codex-fusion-common.sh"      "$HOOKS_DIR/codex-fusion-common.sh"
 install -m 0755 "$HERE/hooks/codex-fusion-userprompt.sh"  "$HOOKS_DIR/codex-fusion-userprompt.sh"
 install -m 0755 "$HERE/hooks/codex-fusion-stop.sh"        "$HOOKS_DIR/codex-fusion-stop.sh"
+install -m 0755 "$HERE/hooks/codex-fusion-subagent-stop.sh" "$HOOKS_DIR/codex-fusion-subagent-stop.sh"
 install -m 0644 "$HERE/skills/codex-fusion-auto/SKILL.md" "$SKILLS_DIR/codex-fusion-auto/SKILL.md"
 echo "Installed hooks + skill into $CLAUDE_DIR"
 
 CF_UPS="$HOOKS_DIR/codex-fusion-userprompt.sh" \
 CF_STOP="$HOOKS_DIR/codex-fusion-stop.sh" \
+CF_SUBSTOP="$HOOKS_DIR/codex-fusion-subagent-stop.sh" \
 CF_SETTINGS="$SETTINGS" "$PY" - <<'PY'
 import json, os, sys, shutil, tempfile
 
 # realpath: users symlink settings.json into dotfile repos; os.replace on the symlink path would
 # swap the link itself for a regular file. Resolve first so the atomic write lands on the target.
 settings = os.path.realpath(os.environ["CF_SETTINGS"])
-ups, stop = os.environ["CF_UPS"], os.environ["CF_STOP"]
+ups, stop, substop = os.environ["CF_UPS"], os.environ["CF_STOP"], os.environ["CF_SUBSTOP"]
 
 data = {}
 orig_text = None
@@ -57,6 +59,7 @@ hooks = data.setdefault("hooks", {})
 HOOK_TIMEOUT = 270
 USERPROMPT_STATUS = "Codex Fusion: checking Codex..."
 STOP_STATUS = "Codex Fusion: reviewing changes..."
+SUBAGENT_STOP_STATUS = "Codex Fusion: verifying subagent..."
 
 def norm(cmd):
     # Match by resolved path so a manually merged "$HOME/..." snippet entry is recognized as the
@@ -90,8 +93,11 @@ def ensure(event, command, status_message):
 
 changed_ups = ensure("UserPromptSubmit", ups, USERPROMPT_STATUS)
 changed_stop = ensure("Stop", stop, STOP_STATUS)
+# No matcher: SubagentStop matchers filter on agent type, and adversarial verification should cover
+# every subagent type, including custom and plugin-scoped ones.
+changed_substop = ensure("SubagentStop", substop, SUBAGENT_STOP_STATUS)
 
-if not (changed_ups or changed_stop):
+if not (changed_ups or changed_stop or changed_substop):
     print("settings.json already has the Codex Fusion hooks; nothing to change.")
     sys.exit(0)
 
@@ -116,8 +122,13 @@ except BaseException:
         pass
     raise
 
-print(f"settings.json merged (UserPromptSubmit updated: {changed_ups}, Stop updated: {changed_stop})")
+print(
+    f"settings.json merged (UserPromptSubmit updated: {changed_ups}, Stop updated: {changed_stop}, "
+    f"SubagentStop updated: {changed_substop})"
+)
 PY
 
 echo
 echo "Done. Restart Claude Code (or reload the window), then run /hooks to confirm."
+echo "      /hooks should list UserPromptSubmit, Stop, and SubagentStop. If your Claude Code build"
+echo "      does not show SubagentStop, upgrade it: the other two hooks keep working regardless."
