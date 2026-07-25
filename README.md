@@ -90,9 +90,16 @@ Subagent verification uses that same prompt-start baseline, but **all of its sta
 Each subagent costs at most one Codex call per distinct *(report + diff)* pair. A subagent that stops
 again having changed nothing does not pay for a second identical Codex run — but it does not slip
 through either: the blocking verdict is cached and replayed, so an unfixed report keeps blocking up
-to `CODEX_FUSION_SUBAGENT_BLOCK_LIMIT` times. At that cap the remaining findings are surfaced to you
-as a `systemMessage` rather than silently dropped. Per-agent state is cleared at the start of every
-new turn.
+to `CODEX_FUSION_SUBAGENT_BLOCK_LIMIT` times. Per-agent state is cleared at the start of every new
+turn.
+
+Every path that declines to block still emits the **full findings** as a `systemMessage`, and that
+message is not suppressed by `CODEX_FUSION_NOTIFY=0` — that knob hides *success* notices, and
+unresolved findings are the opposite. Two such paths exist: hitting the block cap, and an unusable
+state directory. In the latter case the block counter cannot be persisted, so the cap is
+unenforceable and the hook declines to block at all rather than risk repeating without bound (the
+`Stop` hook fails safe here only because it requires a baseline file, which this hook deliberately
+does not).
 
 If the working directory is not a git repository (for example a folder that merely contains
 repositories), the Stop diff review cannot run; Codex Fusion tells you so once per session via a
@@ -159,7 +166,7 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | `CODEX_FUSION_TIMEOUT` | `180` | Per-agent timeout in seconds. The Claude hook registration timeout remains 270s. |
 | `CODEX_FUSION_BUDGET` | `250` | Whole-hook wall-clock budget in seconds. Every primary/fallback attempt is capped by the shared remaining budget. Keep this below the 270s Claude hook registration. |
 | `CODEX_FUSION_STOP_RETRY_LIMIT` | `2` | Number of transient failed Stop review / subagent verification attempts for unchanged input before skipping. |
-| `CODEX_FUSION_NOTIFY` | `1` | Set to `0` to suppress human-facing success `systemMessage` notices. Context injection, blocking review reasons, and the non-git-repo warning still work. |
+| `CODEX_FUSION_NOTIFY` | `1` | Set to `0` to suppress human-facing success `systemMessage` notices. Context injection, blocking review reasons, unresolved subagent verification findings, and the non-git-repo warning still work. |
 | `CODEX_FUSION_EXCLUDE` | — | Extra space-separated globs to exclude from every review surface, on top of the built-in sensitive-path denylist (globs containing spaces are unsupported). |
 | `CODEX_FUSION_MAX_FILE_BYTES` | `204800` | Per-file size cap for untracked files embedded in the review surface; larger files appear as an exclusion marker only. |
 | `CODEX_FUSION_DEBUG=1` | off | Logs gate decisions to `${TMPDIR:-/tmp}/codex-fusion-state-<uid>/debug.log`. |
