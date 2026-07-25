@@ -46,6 +46,9 @@ SUBAGENTS_FILE="$STATE_DIR/$STATE_KEY.subagents"
 NOGIT_MARKER="$STATE_DIR/$STATE_KEY.nogit-warned"
 if cf_ensure_state_dir; then
   rm -f "$NO_REVIEW_FILE" 2>/dev/null
+  # Per-subagent verification state belongs to the previous turn's subagents; drop it so a new turn
+  # re-verifies from scratch and the files do not accumulate for the life of the session.
+  rm -f "$STATE_DIR/$STATE_KEY".agent-* 2>/dev/null
   if cf_review_surface "$CWD" HEAD >"$BASELINE_FILE" 2>/dev/null; then
     # Record the prompt-time HEAD so the Stop hook diffs against it even if Claude commits mid-turn.
     git -C "$CWD" rev-parse --verify HEAD >"$HEAD_FILE" 2>/dev/null || rm -f "$HEAD_FILE" 2>/dev/null

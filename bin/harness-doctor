@@ -25,7 +25,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-CF_SCRIPTS = ("codex-fusion-common.sh", "codex-fusion-userprompt.sh", "codex-fusion-stop.sh")
+# Indexed positionally below: 0 common, 1 userprompt, 2 stop, 3 subagent-stop.
+CF_SCRIPTS = (
+    "codex-fusion-common.sh",
+    "codex-fusion-userprompt.sh",
+    "codex-fusion-stop.sh",
+    "codex-fusion-subagent-stop.sh",
+)
 CLF_PLUGIN_SCRIPTS = (
     "claude-fusion-common.sh",
     "claude-fusion-userprompt.sh",
@@ -343,7 +349,11 @@ class Doctor:
             else:
                 container = data.get("hooks", {}) if isinstance(data, dict) else {}
                 self.add("PASS", "cf.settings.parse", f"{settings_path} is valid JSON")
-        for event, script in (("UserPromptSubmit", CF_SCRIPTS[1]), ("Stop", CF_SCRIPTS[2])):
+        for event, script in (
+            ("UserPromptSubmit", CF_SCRIPTS[1]),
+            ("SubagentStop", CF_SCRIPTS[3]),
+            ("Stop", CF_SCRIPTS[2]),
+        ):
             self.check_registration("cf", container, event, hooks_dir / script, budget,
                                     "settings.json", "whole-hook budget")
 

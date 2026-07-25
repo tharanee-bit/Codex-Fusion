@@ -96,6 +96,40 @@ cf_notify_enabled() {
   [ "${CODEX_FUSION_NOTIFY:-1}" != "0" ]
 }
 
+cf_subagent_verify_mode() {
+  case "${CODEX_FUSION_SUBAGENT_VERIFY:-auto}" in
+    off|OFF|Off) printf 'off';;
+    always|ALWAYS|Always) printf 'always';;
+    *) printf 'auto';;
+  esac
+}
+
+cf_subagent_should_verify() {
+  # $1 = subagent report length in bytes, $2 = 1 when the repo changed since the prompt baseline.
+  # Deliberately near-universal, like the UserPromptSubmit gate: a subagent that touched the tree is
+  # always verified, and one that only reported is verified unless its report is trivially short.
+  case "$(cf_subagent_verify_mode)" in
+    off) printf '0'; return 0;;
+    always) printf '1'; return 0;;
+  esac
+  [ "$2" = "1" ] && { printf '1'; return 0; }
+  [ "${1:-0}" -ge "$(cf_positive_int "${CODEX_FUSION_SUBAGENT_MIN_CHARS:-200}" 200)" ] && { printf '1'; return 0; }
+  printf '0'
+}
+
+cf_subagent_verify_should_fanout() {
+  # $1 = the session's stored subagent preference. Verification defaults to ONE Codex agent: a
+  # SubagentStop fires per subagent, and parallel subagents already multiply the Codex call count.
+  case "$1" in
+    single) printf '0'; return 0;;
+    force) printf '1'; return 0;;
+  esac
+  case "$(cf_subagent_mode)" in
+    always) printf '1'; return 0;;
+  esac
+  printf '0'
+}
+
 cf_sensitive_path() {
   _sp_path="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   _sp_base="${_sp_path##*/}"
@@ -180,8 +214,12 @@ cf_truncate_bytes() {
     printf '%s' "$1"
     return 0
   fi
+  # Drop the trailing partial line with sed, NOT with '${v%"${v##*$'\n'}"}'. Bash 3.2 (macOS's
+  # /bin/bash, which '#!/usr/bin/env bash' resolves to) needs ~30s to match that glob against a
+  # 100KB value; the hook would blow past its registration timeout and a found issue would be lost.
+  # An unbroken cut region has no newline to trim, so keep the raw cut in that case.
   _tb_head="$(printf '%s' "$1" | head -c "$2")"
-  _tb_trim="${_tb_head%"${_tb_head##*$'\n'}"}"
+  _tb_trim="$(printf '%s' "$_tb_head" | sed '$d')"
   [ -n "$_tb_trim" ] && _tb_head="$_tb_trim"
   printf '%s\n[... %s truncated at %s bytes ...]\n' "$_tb_head" "$3" "$2"
 }

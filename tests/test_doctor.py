@@ -98,10 +98,15 @@ class DoctorTestCase(unittest.TestCase):
         skill = self.claude_dir / "skills" / "codex-fusion-auto"
         hooks.mkdir(parents=True)
         skill.mkdir(parents=True)
-        for name in ("codex-fusion-common.sh", "codex-fusion-userprompt.sh", "codex-fusion-stop.sh"):
+        for name in (
+            "codex-fusion-common.sh",
+            "codex-fusion-userprompt.sh",
+            "codex-fusion-stop.sh",
+            "codex-fusion-subagent-stop.sh",
+        ):
             shutil.copy2(ROOT / "hooks" / name, hooks / name)
-        (hooks / "codex-fusion-userprompt.sh").chmod(0o755)
-        (hooks / "codex-fusion-stop.sh").chmod(0o755)
+        for name in ("codex-fusion-userprompt.sh", "codex-fusion-stop.sh", "codex-fusion-subagent-stop.sh"):
+            (hooks / name).chmod(0o755)
         shutil.copy2(ROOT / "skills" / "codex-fusion-auto" / "SKILL.md", skill / "SKILL.md")
         self.write_settings()
 
@@ -136,12 +141,16 @@ class DoctorTestCase(unittest.TestCase):
     def _entry(command, timeout, hook_type="command"):
         return {"hooks": [{"type": hook_type, "command": command, "timeout": timeout}]}
 
-    def write_settings(self, ups_timeout=270, stop_timeout=270, include_stop=True, duplicate_ups=False):
+    def write_settings(self, ups_timeout=270, stop_timeout=270, include_stop=True, duplicate_ups=False,
+                       substop_timeout=270, include_substop=True):
         ups = str(self.claude_dir / "hooks" / "codex-fusion-userprompt.sh")
         stop = str(self.claude_dir / "hooks" / "codex-fusion-stop.sh")
+        substop = str(self.claude_dir / "hooks" / "codex-fusion-subagent-stop.sh")
         hooks = {"UserPromptSubmit": [self._entry(ups, ups_timeout)]}
         if duplicate_ups:
             hooks["UserPromptSubmit"].append(self._entry(ups, ups_timeout))
+        if include_substop:
+            hooks["SubagentStop"] = [self._entry(substop, substop_timeout)]
         if include_stop:
             hooks["Stop"] = [self._entry(stop, stop_timeout)]
         (self.claude_dir / "settings.json").write_text(json.dumps({"hooks": hooks}), encoding="utf-8")

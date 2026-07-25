@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Codex Fusion uninstaller.
-# Removes the Codex Fusion hook entries from ~/.claude/settings.json (backing it up first)
+# Removes the Codex Fusion UserPromptSubmit / Stop / SubagentStop hook entries from
+# ~/.claude/settings.json (backing it up first)
 # and deletes the installed hook scripts and skill. Other hooks/settings are left intact.
 set -euo pipefail
 
@@ -23,11 +24,24 @@ except Exception as e:
 hooks = d.get("hooks", {})
 removed = 0
 
+# Match our own scripts by exact basename, not by a bare "codex-fusion" substring: a user hook named
+# something like my-codex-fusion-wrapper.sh must survive an uninstall.
+CF_SCRIPTS = (
+    "codex-fusion-userprompt.sh",
+    "codex-fusion-stop.sh",
+    "codex-fusion-subagent-stop.sh",
+    "codex-fusion-common.sh",
+)
+
+def is_codex_fusion(command):
+    c = command or ""
+    return any(c == s or c.endswith("/" + s) or ("/" + s) in c for s in CF_SCRIPTS)
+
 def strip(event):
     global removed
     new = []
     for grp in hooks.get(event, []):
-        kept = [h for h in grp.get("hooks", []) if "codex-fusion" not in (h.get("command") or "")]
+        kept = [h for h in grp.get("hooks", []) if not is_codex_fusion(h.get("command"))]
         removed += len(grp.get("hooks", [])) - len(kept)
         if kept:
             g = dict(grp); g["hooks"] = kept; new.append(g)
@@ -36,7 +50,7 @@ def strip(event):
     elif event in hooks:
         del hooks[event]
 
-for e in ("UserPromptSubmit", "Stop"):
+for e in ("UserPromptSubmit", "Stop", "SubagentStop"):
     strip(e)
 if not hooks and "hooks" in d:
     del d["hooks"]
@@ -66,6 +80,7 @@ print("Removed Codex Fusion hook entries from settings.json (backup: *.codex-fus
 PY
 fi
 
-rm -f "$CLAUDE_DIR/hooks/codex-fusion-common.sh" "$CLAUDE_DIR/hooks/codex-fusion-userprompt.sh" "$CLAUDE_DIR/hooks/codex-fusion-stop.sh"
+rm -f "$CLAUDE_DIR/hooks/codex-fusion-common.sh" "$CLAUDE_DIR/hooks/codex-fusion-userprompt.sh" \
+      "$CLAUDE_DIR/hooks/codex-fusion-stop.sh" "$CLAUDE_DIR/hooks/codex-fusion-subagent-stop.sh"
 rm -rf "$CLAUDE_DIR/skills/codex-fusion-auto"
 echo "Removed hook scripts and skill. Restart Claude Code to apply."
