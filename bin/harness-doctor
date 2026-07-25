@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""Read-only health check for the Codex Fusion <-> Claude Fusion harness.
+
+The Claude Fusion direction is plugin-first. With probes enabled the doctor asks Codex for the
+installed marketplace plugin, then validates its dynamically reported version against the local
+versioned cache and marketplace payload. With --skip-probes, or if that CLI query fails, it derives
+the same state from config.toml and the cache. Legacy standalone hooks are checked only when no
+plugin installation is found. An empty legacy hooks.json alone is inactive; orphaned legacy scripts
+are treated as a partial legacy installation and checked accordingly.
+
+Usage: harness-doctor [--strict] [--skip-probes]
+Exit codes: 0 = no FAIL (WARNs allowed unless --strict), 1 = FAIL (or strict WARN), 2 = internal error.
+
+READ-ONLY GUARANTEE: this tool does not create, modify, or delete files. Its subprocesses are
+read-only version/help/config-list/syntax/repository probes.
+"""
+
+import argparse
+import filecmp
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# Indexed positionally below: 0 common, 1 userprompt, 2 stop, 3 subagent-stop.
+CF_SCRIPTS = (
+    "codex-fusion-common.sh",
+    "codex-fusion-userprompt.sh",
+    "codex-fusion-stop.sh",
+    "codex-fusion-subagent-stop.sh",
+)
+CLF_PLUGIN_SCRIPTS = (
+    "claude-fusion-common.sh",
+    "claude-fusion-userprompt.sh",
+    "claude-fusion-subagent-stop.sh",
+    "claude-fusion-stop.sh",
+)
+CLF_LEGACY_SCRIPTS = (
+    "claude-fusion-common.sh",
+    "claude-fusion-userprompt.sh",
+    "claude-fusion-stop.sh",
+)
+CLF_PLUGIN_ID = "claude-fusion@claude-fusion"
+CLF_MARKETPLACE = "claude-fusion"
+CLF_PLUGIN_EVENTS = {
+    "UserPromptSubmit": "claude-fusion-userprompt.sh",
+    "SubagentStop": "claude-fusion-subagent-stop.sh",
+    "Stop": "claude-fusion-stop.sh",
+}
+HOOK_KEYS = {"UserPromptSubmit": "userprompt", "SubagentStop": "subagent-stop", "Stop": "stop"}
+TRUST_FRAGMENTS = {
+    "UserPromptSubmit": "user_prompt_submit",
+    "SubagentStop": "subagent_stop",
+    "Stop": "stop",
+}
+# Mirrors the shell hooks' SAFE_MODE case patterns exactly (a value like "fAlSe" does NOT disable).
+SAFE_MODE_DISABLED = {"0", "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"}
+CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+CODEX_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+PLUGIN_VERSION_RE = re.compile(r"[0-9A-Za-z]+(?:[._+-][0-9A-Za-z]+)*\Z")
+
+
+def norm(cmd):
+    return os.path.normpath(os.path.expanduser(os.path.expandvars(cmd or "")))
+
+
+def positive_int(value, default):
+    value = str(value if value is not None else "").strip()
+    return int(value) if value.isdigit() and int(value) > 0 else default
+
+
+class Doctor:
+    def __init__(self, skip_probes=False):
+        self.skip_probes = skip_probes
+        self.results = []
+        self.claude_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+        self.codex_dir = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        self.own_repo = Path(__file__).resolve().parents[1]
+        self.peer_repo = Path(os.environ.get("CLAUDE_FUSION_REPO") or self.own_repo.parent / "Claude Fusion")
+        self.tmpdir = Path(os.environ.get("TMPDIR") or "/tmp")
+        self.codex_bin = None
+
+    def add(self, level, check, message):
+        self.results.append((level, check, message))
+
+    # --- read-only probes and parsers -------------------------------------------------------
+    def resolve_bin(self, name):
+        found = shutil.which(name)
+        if found:
+            return found
+        home = Path.home()
+        for candidate in (home / ".local/bin" / name, home / "bin" / name,
+                          Path("/usr/local/bin") / name, home / ".npm-global/bin" / name):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        return None
+
+    @staticmethod
+    def probe(argv, timeout_s=10):
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
+                                    stdin=subprocess.DEVNULL)
+            return result.returncode, (result.stdout or "") + (result.stderr or "")
+        except (OSError, subprocess.TimeoutExpired):
+            return None, ""
+
+    @staticmethod
+    def load_json(path):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data, None
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
+            return None, error
+
+    def load_config(self):
+        try:
+            import tomllib
+        except ImportError:
+            return None, "tomllib unavailable (python < 3.11)"
+        config = self.codex_dir / "config.toml"
+        try:
+            return tomllib.loads(config.read_text(encoding="utf-8")), None
+        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+            return None, str(error)
+
+    # --- shared checks ----------------------------------------------------------------------
+    def check_shared(self):
+        missing = [binary for binary in ("git", "timeout", "bash") if not shutil.which(binary)]
+        if missing:
+            self.add("FAIL", "env.binaries", f"missing from PATH: {', '.join(missing)} (hooks silently skip)")
+        else:
+            self.add("PASS", "env.binaries", "git, timeout, bash resolve")
+
+        uid = os.getuid()
+        for side in ("codex", "claude"):
+            state = self.tmpdir / f"{side}-fusion-state-{uid}"
+            check = f"state.{side}-fusion"
+            if not state.exists():
+                self.add("PASS", check, f"{state} absent (created on first hook run)")
+            elif not state.is_dir():
+                self.add("WARN", check, f"{state} exists but is not a directory")
+            else:
+                stat_result = state.stat()
+                mode = stat_result.st_mode & 0o777
+                if stat_result.st_uid != uid:
+                    self.add("WARN", check, f"{state} is owned by uid {stat_result.st_uid}; hooks will refuse it")
+                elif mode != 0o700:
+                    self.add("WARN", check, f"{state} mode is {mode:o}, expected 700")
+                else:
+                    self.add("PASS", check, f"{state} owned, mode 700")
+
+        for flag in ("CLAUDE_FUSION_ACTIVE", "CODEX_FUSION_ACTIVE"):
+            if os.environ.get(flag) == "1":
+                self.add("WARN", "cross.env", f"{flag}=1 is exported; every nested fusion hook silently skips")
+        overrides = sorted(
+            key for key in os.environ
+            if key.startswith(("CODEX_FUSION_", "CLAUDE_FUSION_"))
+            and key not in ("CLAUDE_FUSION_ACTIVE", "CODEX_FUSION_ACTIVE", "CLAUDE_FUSION_REPO")
+        )
+        if overrides:
+            self.add("INFO", "cross.env", "overrides set: " + ", ".join(overrides))
+
+        if not self.skip_probes:
+            rc, _ = self.probe(["git", "rev-parse", "--is-inside-work-tree"], 5)
+            if rc != 0:
+                self.add("INFO", "cross.cwd", f"{os.getcwd()} is not a git repository; Stop review is disabled")
+
+    # --- generic direction checks -----------------------------------------------------------
+    @staticmethod
+    def fusion_entries(container, event, target):
+        found = []
+        event_groups = container.get(event, []) if isinstance(container, dict) else []
+        for group in event_groups or []:
+            if not isinstance(group, dict):
+                continue
+            for hook in group.get("hooks", []) or []:
+                if isinstance(hook, dict) and norm(hook.get("command")) == norm(str(target)):
+                    found.append(hook)
+        return found
+
+    def check_registration(self, prefix, container, event, target, limit, config_name, limit_name,
+                           exclusive=False):
+        key = HOOK_KEYS[event]
+        event_groups = container.get(event, []) if isinstance(container, dict) else []
+        all_entries = []
+        malformed = not isinstance(event_groups, list)
+        for group in event_groups if isinstance(event_groups, list) else []:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                malformed = True
+                continue
+            for hook in group["hooks"]:
+                if isinstance(hook, dict):
+                    all_entries.append(hook)
+                else:
+                    malformed = True
+        if exclusive and (malformed or len(all_entries) != 1):
+            detail = "malformed registration structure" if malformed else f"contains {len(all_entries)} hook commands"
+            self.add("FAIL", f"{prefix}.hooks.{key}",
+                     f"{event} must contain exactly one hook command in {config_name}; {detail}")
+        entries = self.fusion_entries(container, event, target)
+        if not entries:
+            self.add("FAIL", f"{prefix}.hooks.{key}", f"not registered in {config_name}")
+            return
+        if len(entries) > 1:
+            self.add("FAIL", f"{prefix}.hooks.{key}", f"registered {len(entries)} times in {config_name}")
+        else:
+            self.add("PASS", f"{prefix}.hooks.{key}", f"registered once in {config_name}")
+        for hook in entries:
+            if hook.get("type") != "command":
+                self.add("FAIL", f"{prefix}.hooks.{key}",
+                         f"matching registration type {hook.get('type')!r} must be 'command'")
+            registered = hook.get("timeout")
+            if not isinstance(registered, (int, float)) or registered <= limit:
+                self.add("FAIL", f"{prefix}.hooks.timeout",
+                         f"{event} registration timeout {registered!r} must exceed {limit_name} {limit}s")
+            else:
+                self.add("PASS", f"{prefix}.hooks.timeout",
+                         f"{event} {int(registered)}s > {limit_name} {limit}s")
+
+    def check_scripts(self, prefix, hooks_dir, scripts):
+        missing = [script for script in scripts if not (hooks_dir / script).is_file()]
+        if missing:
+            self.add("FAIL", f"{prefix}.files.installed", f"missing under {hooks_dir}: {', '.join(missing)}")
+            return
+        no_exec = [script for script in scripts[1:] if not os.access(hooks_dir / script, os.X_OK)]
+        if no_exec:
+            self.add("FAIL", f"{prefix}.files.installed", f"not executable: {', '.join(no_exec)}")
+        else:
+            self.add("PASS", f"{prefix}.files.installed", "all hook scripts present; executable bits intact")
+
+    def check_file_parity(self, prefix, installed_dir, source_dir, files):
+        missing_source = [name for name in files if not (source_dir / name).is_file()]
+        drifted = [name for name in files
+                   if (installed_dir / name).is_file() and (source_dir / name).is_file()
+                   and not filecmp.cmp(installed_dir / name, source_dir / name, shallow=False)]
+        if drifted:
+            self.add("FAIL", f"{prefix}.files.parity", f"differ from source: {', '.join(drifted)}")
+        elif missing_source:
+            self.add("WARN", f"{prefix}.files.parity", f"missing in source: {', '.join(missing_source)}")
+        elif all((installed_dir / name).is_file() for name in files):
+            self.add("PASS", f"{prefix}.files.parity", "installed files byte-identical to source")
+
+    def check_tree_parity(self, left_root, right_root, check, left_label, right_label):
+        if not left_root.is_dir() or not right_root.is_dir():
+            self.add("FAIL", check,
+                     f"{left_label} or {right_label} payload missing ({left_root}, {right_root})")
+            return
+        left_files = {path.relative_to(left_root) for path in left_root.rglob("*") if path.is_file()}
+        right_files = {path.relative_to(right_root) for path in right_root.rglob("*") if path.is_file()}
+        only_left = sorted(str(path) for path in left_files - right_files)
+        only_right = sorted(str(path) for path in right_files - left_files)
+        drifted = sorted(str(path) for path in left_files & right_files
+                         if not filecmp.cmp(left_root / path, right_root / path, shallow=False))
+        if only_left or only_right or drifted:
+            details = []
+            if only_left:
+                details.append(f"{left_label}-only=" + ",".join(only_left))
+            if only_right:
+                details.append(f"{right_label}-only=" + ",".join(only_right))
+            if drifted:
+                details.append("different=" + ",".join(drifted))
+            self.add("FAIL", check, "; ".join(details))
+        else:
+            self.add("PASS", check, f"{left_label} is byte-identical to {right_label}")
+
+    def check_skill(self, prefix, installed, source=None):
+        if not installed.is_file():
+            self.add("FAIL" if prefix == "clf" else "WARN", f"{prefix}.skill", f"{installed} missing")
+        elif source and source.is_file() and not filecmp.cmp(installed, source, shallow=False):
+            self.add("FAIL", f"{prefix}.skill", f"{installed} differs from marketplace payload")
+        else:
+            self.add("PASS", f"{prefix}.skill", f"{installed.parent.name}/SKILL.md installed")
+
+    def check_flags(self, prefix, common_path, required):
+        if not common_path.is_file():
+            return
+        text = common_path.read_text(encoding="utf-8", errors="replace")
+        lost = [flag for flag in required if flag not in text]
+        if lost:
+            self.add("FAIL", f"{prefix}.flags.readonly",
+                     f"{common_path.name} lost required flag(s): {', '.join(lost)}")
+        else:
+            self.add("PASS", f"{prefix}.flags.readonly", "read-only invocation flags present")
+
+    def check_recursion(self, prefix, common_path):
+        if not common_path.is_file():
+            return
+        text = common_path.read_text(encoding="utf-8", errors="replace")
+        if "CLAUDE_FUSION_ACTIVE" in text and "CODEX_FUSION_ACTIVE" in text:
+            self.add("PASS", f"{prefix}.recursion", f"{common_path.name} references both fusion-active flags")
+        else:
+            self.add("FAIL", f"{prefix}.recursion", f"{common_path.name} is missing a fusion-active flag")
+
+    def check_syntax(self, prefix, hooks_dir, scripts):
+        if self.skip_probes:
+            self.add("INFO", f"{prefix}.syntax", "skipped (--skip-probes)")
+            return
+        bad = []
+        for script in scripts:
+            path = hooks_dir / script
+            if path.is_file():
+                rc, output = self.probe(["bash", "-n", str(path)], 10)
+                if rc != 0:
+                    tail = output.strip().splitlines()
+                    bad.append(f"{script}: {tail[-1] if tail else 'rc=' + str(rc)}")
+        if bad:
+            self.add("FAIL", f"{prefix}.syntax", "; ".join(bad))
+        else:
+            self.add("PASS", f"{prefix}.syntax", "bash -n clean on installed scripts")
+
+    def check_binary(self, prefix, name):
+        path = self.resolve_bin(name)
+        check = f"{prefix}.bin.{name}"
+        if not path:
+            self.add("FAIL", check, f"'{name}' not found; hooks silently skip")
+            return None
+        if self.skip_probes:
+            self.add("INFO", check, f"{path} (version probe skipped)")
+            return path
+        rc, output = self.probe([path, "--version"], 10)
+        first = output.strip().splitlines()[0] if output.strip() else ""
+        if rc == 0:
+            self.add("PASS", check, f"{path} ({first})" if first else path)
+        else:
+            self.add("WARN", check, f"{path} failed --version (rc={rc})")
+        return path
+
+    # --- Codex Fusion direction (Claude Code side) -----------------------------------------
+    def check_cf(self):
+        hooks_dir = self.claude_dir / "hooks"
+        settings_path = self.claude_dir / "settings.json"
+        installed = any((hooks_dir / script).exists() for script in CF_SCRIPTS)
+        if not installed and not settings_path.exists():
+            self.add("INFO", "cf", f"Codex Fusion not installed under {self.claude_dir}; direction skipped")
+            return
+
+        per_call = positive_int(os.environ.get("CODEX_FUSION_TIMEOUT"), 180)
+        budget = positive_int(os.environ.get("CODEX_FUSION_BUDGET"), 250)
+        container = {}
+        if not settings_path.exists():
+            self.add("FAIL", "cf.settings.parse", f"{settings_path} missing")
+        else:
+            data, error = self.load_json(settings_path)
+            if error:
+                self.add("FAIL", "cf.settings.parse", f"{settings_path} is not valid JSON ({error})")
+            else:
+                container = data.get("hooks", {}) if isinstance(data, dict) else {}
+                self.add("PASS", "cf.settings.parse", f"{settings_path} is valid JSON")
+        for event, script in (
+            ("UserPromptSubmit", CF_SCRIPTS[1]),
+            ("SubagentStop", CF_SCRIPTS[3]),
+            ("Stop", CF_SCRIPTS[2]),
+        ):
+            self.check_registration("cf", container, event, hooks_dir / script, budget,
+                                    "settings.json", "whole-hook budget")
+
+        self.check_scripts("cf", hooks_dir, CF_SCRIPTS)
+        self.check_file_parity("cf", hooks_dir, self.own_repo / "hooks", CF_SCRIPTS)
+        self.check_skill("cf", self.claude_dir / "skills/codex-fusion-auto/SKILL.md",
+                         self.own_repo / "skills/codex-fusion-auto/SKILL.md")
+        common = hooks_dir / CF_SCRIPTS[0]
+        self.check_flags("cf", common, ("--sandbox read-only", "--ask-for-approval never"))
+        self.check_recursion("cf", common)
+        self.check_syntax("cf", hooks_dir, CF_SCRIPTS)
+        self.codex_bin = self.check_binary("cf", "codex")
+
+        model = os.environ.get("CODEX_FUSION_MODEL", "gpt-5.6-sol")
+        effort = os.environ.get("CODEX_FUSION_EFFORT", "xhigh")
+        if os.environ.get("CODEX_FUSION_EFFORT") and effort not in CODEX_EFFORTS:
+            self.add("WARN", "cf.config", f"CODEX_FUSION_EFFORT={effort!r} is not a known codex effort")
+        else:
+            self.add("INFO", "cf.config",
+                     f"codex model={model} effort={effort} per-call={per_call}s whole-hook={budget}s")
+
+    # --- Claude Fusion plugin discovery -----------------------------------------------------
+    def plugin_from_cli(self):
+        if self.skip_probes:
+            self.add("INFO", "clf.plugin.discovery", "CLI query skipped; inspecting config/cache")
+            return None, False
+        codex_bin = self.codex_bin or self.resolve_bin("codex")
+        if not codex_bin:
+            self.add("INFO", "clf.plugin.discovery", "codex unavailable; inspecting config/cache")
+            return None, False
+        argv = [codex_bin, "plugin", "list", "--marketplace", CLF_MARKETPLACE, "--json"]
+        rc, output = self.probe(argv, 15)
+        if rc != 0:
+            self.add("INFO", "clf.plugin.discovery", f"plugin list failed (rc={rc}); inspecting config/cache")
+            return None, False
+        try:
+            payload = json.loads(output)
+        except (json.JSONDecodeError, TypeError):
+            self.add("INFO", "clf.plugin.discovery", "plugin list returned invalid JSON; inspecting config/cache")
+            return None, False
+        if (not isinstance(payload, dict)
+                or not isinstance(payload.get("installed"), list)
+                or not isinstance(payload.get("available"), list)
+                or not all(isinstance(entry, dict)
+                           for entry in payload["installed"] + payload["available"])):
+            self.add("INFO", "clf.plugin.discovery", "plugin list JSON schema invalid; inspecting config/cache")
+            return None, False
+        entries = payload["installed"] + payload["available"]
+        plugin = next((entry for entry in entries
+                       if isinstance(entry, dict) and entry.get("pluginId") == CLF_PLUGIN_ID), None)
+        if plugin is None:
+            self.add("INFO", "clf.plugin.discovery", "Claude Fusion plugin not listed by Codex")
+            return None, True
+        self.add("PASS", "clf.plugin.discovery", "discovered via codex plugin list")
+        return plugin, True
+
+    def plugin_from_files(self):
+        config, config_error = self.load_config()
+        enabled = None
+        if isinstance(config, dict):
+            plugins = config.get("plugins", {})
+            if isinstance(plugins, dict) and isinstance(plugins.get(CLF_PLUGIN_ID), dict):
+                enabled = plugins[CLF_PLUGIN_ID].get("enabled")
+
+        marketplace_root = self.codex_dir / ".tmp/marketplaces" / CLF_MARKETPLACE / "plugins/claude-fusion"
+        manifest, _ = self.load_json(marketplace_root / ".codex-plugin/plugin.json")
+        version = manifest.get("version") if isinstance(manifest, dict) else None
+        cache_parent = self.codex_dir / "plugins/cache" / CLF_MARKETPLACE / "claude-fusion"
+        if not version and cache_parent.is_dir():
+            candidates = []
+            for path in cache_parent.iterdir():
+                cached_manifest, _ = self.load_json(path / ".codex-plugin/plugin.json")
+                if path.is_dir() and isinstance(cached_manifest, dict) and cached_manifest.get("name") == "claude-fusion":
+                    candidates.append((path.name, path))
+            if len(candidates) == 1:
+                version = candidates[0][0]
+
+        indicators = enabled is not None or marketplace_root.is_dir() or cache_parent.is_dir()
+        if not indicators:
+            if config_error and config_error != "tomllib unavailable (python < 3.11)":
+                self.add("INFO", "clf.plugin.discovery", f"config unavailable ({config_error})")
+            return None
+        self.add("PASS", "clf.plugin.discovery", "discovered from config/cache fallback")
+        return {
+            "pluginId": CLF_PLUGIN_ID,
+            "name": "claude-fusion",
+            "marketplaceName": CLF_MARKETPLACE,
+            "version": version,
+            "installed": bool(version),
+            "enabled": enabled is True,
+            "source": {"source": "local", "path": str(marketplace_root)},
+        }
+
+    def check_plugin_metadata(self, plugin):
+        installed = plugin.get("installed") is True
+        enabled = plugin.get("enabled") is True
+        if installed:
+            self.add("PASS", "clf.plugin.installed", "Claude Fusion plugin is installed")
+        else:
+            self.add("FAIL", "clf.plugin.installed", "Claude Fusion plugin is not installed")
+        if enabled:
+            self.add("PASS", "clf.plugin.enabled", "Claude Fusion plugin is enabled")
+        else:
+            self.add("FAIL", "clf.plugin.enabled", "Claude Fusion plugin is disabled or not enabled in config.toml")
+        version = plugin.get("version")
+        if (not isinstance(version, str) or len(version) > 128
+                or not PLUGIN_VERSION_RE.fullmatch(version)):
+            self.add("FAIL", "clf.plugin.version", f"invalid or missing discovered version: {version!r}")
+            return None
+        self.add("PASS", "clf.plugin.version", f"dynamically discovered version {version}")
+        return version
+
+    def check_clf_plugin(self, plugin):
+        version = self.check_plugin_metadata(plugin)
+        if not version:
+            return
+        cache_parent = (self.codex_dir / "plugins/cache" / CLF_MARKETPLACE / "claude-fusion").resolve()
+        cache_root = (cache_parent / version).resolve()
+        try:
+            cache_root.relative_to(cache_parent)
+        except ValueError:
+            self.add("FAIL", "clf.plugin.cache", f"resolved cache path escapes {cache_parent}")
+            return
+        source = plugin.get("source") if isinstance(plugin.get("source"), dict) else {}
+        source_path = source.get("path") if isinstance(source, dict) else None
+        marketplace_parent = (self.codex_dir / ".tmp/marketplaces" / CLF_MARKETPLACE).resolve()
+        expected_marketplace = (marketplace_parent / "plugins/claude-fusion").resolve()
+        try:
+            expected_marketplace.relative_to(marketplace_parent)
+        except ValueError:
+            self.add("FAIL", "clf.plugin.marketplace",
+                     f"expected marketplace payload escapes {marketplace_parent}")
+            return
+        marketplace_root = Path(source_path).resolve() if isinstance(source_path, str) and source_path else expected_marketplace
+        try:
+            marketplace_root.relative_to(expected_marketplace)
+        except ValueError:
+            self.add("FAIL", "clf.plugin.marketplace",
+                     f"CLI source is outside expected marketplace payload: {marketplace_root}")
+            return
+
+        cache_manifest, cache_error = self.load_json(cache_root / ".codex-plugin/plugin.json")
+        if cache_error or not isinstance(cache_manifest, dict):
+            self.add("FAIL", "clf.plugin.cache", f"versioned cache manifest missing/invalid ({cache_error})")
+        elif cache_manifest.get("name") != "claude-fusion" or cache_manifest.get("version") != version:
+            self.add("FAIL", "clf.plugin.cache", "cache manifest name/version does not match discovery")
+        else:
+            self.add("PASS", "clf.plugin.cache", f"versioned cache exists for {version}")
+
+        market_manifest, market_error = self.load_json(marketplace_root / ".codex-plugin/plugin.json")
+        if market_error or not isinstance(market_manifest, dict):
+            self.add("FAIL", "clf.plugin.marketplace", f"marketplace payload manifest missing/invalid ({market_error})")
+        elif market_manifest.get("name") != "claude-fusion" or market_manifest.get("version") != version:
+            self.add("FAIL", "clf.plugin.marketplace", "marketplace manifest name/version does not match discovery")
+        else:
+            self.add("PASS", "clf.plugin.marketplace", f"marketplace payload matches version {version}")
+        self.check_tree_parity(cache_root, marketplace_root, "clf.plugin.parity",
+                               "versioned cache", "marketplace payload")
+
+        canonical_root = (self.peer_repo / "plugins/claude-fusion").resolve()
+        if canonical_root.is_dir():
+            self.check_tree_parity(marketplace_root, canonical_root, "clf.plugin.source-parity",
+                                   "marketplace payload", "canonical source")
+        elif self.peer_repo.exists():
+            self.add("FAIL", "clf.plugin.source-parity",
+                     f"canonical plugin payload missing under {self.peer_repo}")
+        else:
+            self.add("INFO", "clf.plugin.source-parity",
+                     f"canonical checkout unavailable at {self.peer_repo}; source parity not checked")
+
+        hooks_dir = cache_root / "hooks"
+        hooks_path = hooks_dir / "hooks.json"
+        hook_data, hook_error = self.load_json(hooks_path)
+        container = {}
+        if hook_error or not isinstance(hook_data, dict):
+            self.add("FAIL", "clf.hooks.parse", f"{hooks_path} is not valid JSON ({hook_error})")
+        else:
+            container = hook_data.get("hooks", {}) if isinstance(hook_data.get("hooks"), dict) else {}
+            self.add("PASS", "clf.hooks.parse", f"plugin hooks manifest is valid JSON")
+            discovered_events = set(container)
+            expected_events = set(CLF_PLUGIN_EVENTS)
+            if discovered_events == expected_events:
+                self.add("PASS", "clf.hooks.events", "plugin manifest contains exactly the three supported events")
+            else:
+                missing = sorted(expected_events - discovered_events)
+                unexpected = sorted(discovered_events - expected_events)
+                details = []
+                if missing:
+                    details.append("missing=" + ",".join(missing))
+                if unexpected:
+                    details.append("unexpected=" + ",".join(unexpected))
+                self.add("FAIL", "clf.hooks.events", "; ".join(details))
+
+        depth = os.environ.get("CLAUDE_FUSION_DEPTH", "workflow")
+        internal = min(positive_int(os.environ.get("CLAUDE_FUSION_TIMEOUT"),
+                                    600 if depth == "workflow" else 300), 630)
+        for event, script in CLF_PLUGIN_EVENTS.items():
+            target = "${PLUGIN_ROOT}/hooks/" + script
+            self.check_registration("clf", container, event, target, internal,
+                                    "plugin hooks/hooks.json", "internal timeout", exclusive=True)
+
+        self.check_scripts("clf", hooks_dir, CLF_PLUGIN_SCRIPTS)
+        common = hooks_dir / CLF_PLUGIN_SCRIPTS[0]
+        self.check_flags("clf", common, ("--permission-mode plan", "--no-session-persistence"))
+        self.check_recursion("clf", common)
+        self.check_syntax("clf", hooks_dir, CLF_PLUGIN_SCRIPTS)
+        self.check_skill("clf", cache_root / "skills/claude-fusion-auto/SKILL.md",
+                         marketplace_root / "skills/claude-fusion-auto/SKILL.md")
+        claude_bin = self.check_binary("clf", "claude")
+        self.check_safe_mode(claude_bin)
+        self.check_plugin_trust()
+        self.check_clf_config(depth, internal)
+
+    # --- Claude Fusion legacy fallback ------------------------------------------------------
+    def legacy_state(self):
+        hooks_dir = self.codex_dir / "hooks"
+        hooks_path = self.codex_dir / "hooks.json"
+        container = {}
+        if hooks_path.is_file():
+            data, _ = self.load_json(hooks_path)
+            if isinstance(data, dict):
+                container = data.get("hooks", data)
+                if not isinstance(container, dict):
+                    container = {}
+        installed = any((hooks_dir / script).exists() for script in CLF_LEGACY_SCRIPTS)
+        targets = (hooks_dir / CLF_LEGACY_SCRIPTS[1], hooks_dir / CLF_LEGACY_SCRIPTS[2])
+        registered = any(self.fusion_entries(container, event, target)
+                         for event, target in zip(("UserPromptSubmit", "Stop"), targets))
+        return installed or registered, container
+
+    def check_clf_legacy(self, container):
+        self.add("WARN", "clf.mode", "legacy standalone Claude Fusion detected; plugin mode is recommended")
+        hooks_dir = self.codex_dir / "hooks"
+        hooks_path = self.codex_dir / "hooks.json"
+        depth = os.environ.get("CLAUDE_FUSION_DEPTH", "workflow")
+        internal = min(positive_int(os.environ.get("CLAUDE_FUSION_TIMEOUT"),
+                                    600 if depth == "workflow" else 300), 630)
+        for event, script in (("UserPromptSubmit", CLF_LEGACY_SCRIPTS[1]), ("Stop", CLF_LEGACY_SCRIPTS[2])):
+            self.check_registration("clf", container, event, hooks_dir / script, internal,
+                                    "legacy hooks.json", "internal timeout")
+        self.check_scripts("clf", hooks_dir, CLF_LEGACY_SCRIPTS)
+        if self.peer_repo.is_dir():
+            self.check_file_parity("clf", hooks_dir, self.peer_repo / "hooks", CLF_LEGACY_SCRIPTS)
+        else:
+            self.add("INFO", "clf.files.parity", "legacy peer repo unavailable; parity skipped")
+        common = hooks_dir / CLF_LEGACY_SCRIPTS[0]
+        self.check_flags("clf", common, ("--permission-mode plan", "--no-session-persistence"))
+        self.check_recursion("clf", common)
+        self.check_syntax("clf", hooks_dir, CLF_LEGACY_SCRIPTS)
+        self.check_skill("clf", self.codex_dir / "skills/claude-fusion-auto/SKILL.md",
+                         self.peer_repo / "skills/claude-fusion-auto/SKILL.md")
+        claude_bin = self.check_binary("clf", "claude")
+        self.check_safe_mode(claude_bin)
+        self.check_legacy_trust(hooks_path)
+        self.check_clf_config(depth, internal)
+
+    def check_clf(self):
+        plugin, cli_authoritative = self.plugin_from_cli()
+        if plugin is None and not cli_authoritative:
+            plugin = self.plugin_from_files()
+        if plugin is not None:
+            self.add("PASS", "clf.mode", "Claude Fusion plugin mode active")
+            self.check_clf_plugin(plugin)
+            return
+        legacy_active, container = self.legacy_state()
+        if legacy_active:
+            self.check_clf_legacy(container)
+        else:
+            self.add("INFO", "clf", "Claude Fusion plugin and legacy standalone hooks are inactive; direction skipped")
+
+    def check_safe_mode(self, claude_bin):
+        safe_mode_on = os.environ.get("CLAUDE_FUSION_SAFE_MODE", "1") not in SAFE_MODE_DISABLED
+        if not safe_mode_on:
+            self.add("WARN", "clf.safemode", "safe mode disabled; automatic consults load local customizations")
+            return
+        if self.skip_probes:
+            self.add("INFO", "clf.safemode", "probe skipped (--skip-probes)")
+            return
+        if not claude_bin:
+            return
+        rc, output = self.probe([claude_bin, "--help"], 15)
+        if "--safe-mode" in output:
+            self.add("PASS", "clf.safemode", "installed claude supports --safe-mode")
+        elif not output.strip():
+            self.add("WARN", "clf.safemode", f"could not probe {claude_bin} --help (rc={rc})")
+        else:
+            self.add("FAIL", "clf.safemode", "installed claude lacks --safe-mode; automatic consults silently skip")
+
+    def check_plugin_trust(self):
+        config, error = self.load_config()
+        if error or not isinstance(config, dict):
+            self.add("WARN", "clf.trust", f"config.toml unavailable/invalid ({error})")
+            return
+        hooks = config.get("hooks", {}) if isinstance(config.get("hooks"), dict) else {}
+        state = hooks.get("state", {}) if isinstance(hooks.get("state"), dict) else {}
+        prefix = CLF_PLUGIN_ID + ":hooks/hooks.json:"
+        missing = [fragment for fragment in TRUST_FRAGMENTS.values()
+                   if not any(key.startswith(prefix) and f":{fragment}:" in key for key in state)]
+        if missing:
+            self.add("WARN", "clf.trust", f"plugin-prefixed trust missing for: {', '.join(missing)}; run /hooks")
+        else:
+            self.add("INFO", "clf.trust",
+                     "all three plugin-prefixed trust keys are present, but hash freshness is unverified; run /hooks")
+
+    def check_legacy_trust(self, hooks_json):
+        config, error = self.load_config()
+        if error or not isinstance(config, dict):
+            self.add("WARN", "clf.trust", f"config.toml unavailable/invalid ({error})")
+            return
+        hooks = config.get("hooks", {}) if isinstance(config.get("hooks"), dict) else {}
+        state = hooks.get("state", {}) if isinstance(hooks.get("state"), dict) else {}
+        paths = {str(hooks_json), os.path.realpath(hooks_json)}
+        missing = [fragment for fragment in ("user_prompt_submit", "stop")
+                   if not any(f":{fragment}:" in key and any(key.startswith(path + ":") for path in paths)
+                              for key in state)]
+        if missing:
+            self.add("WARN", "clf.trust", f"legacy hook trust missing for: {', '.join(missing)}; run /hooks")
+        else:
+            self.add("INFO", "clf.trust",
+                     "both legacy trust keys are present, but hash freshness is unverified; run /hooks")
+
+    def check_clf_config(self, depth, internal):
+        model = os.environ.get("CLAUDE_FUSION_MODEL", "opus")
+        effort = os.environ.get("CLAUDE_FUSION_EFFORT", "xhigh")
+        if os.environ.get("CLAUDE_FUSION_EFFORT") and effort not in CLAUDE_EFFORTS:
+            self.add("WARN", "clf.config", f"CLAUDE_FUSION_EFFORT={effort!r} is not a known claude effort")
+        else:
+            self.add("INFO", "clf.config", f"claude model={model} effort={effort} depth={depth} timeout={internal}s")
+
+    # --- reporting --------------------------------------------------------------------------
+    def report(self, strict=False):
+        width = max((len(check) for _, check, _ in self.results), default=0)
+        for level, check, message in self.results:
+            print(f"{level:<5} {check:<{width}}  {message}")
+        counts = {level: sum(1 for result in self.results if result[0] == level)
+                  for level in ("PASS", "WARN", "FAIL")}
+        print(f"harness-doctor: {counts['PASS']} pass, {counts['WARN']} warn, {counts['FAIL']} fail")
+        if counts["FAIL"] or (strict and counts["WARN"]):
+            return 1
+        return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="harness-doctor",
+        description="Read-only health check for the Codex Fusion <-> Claude Fusion harness.")
+    parser.add_argument("--strict", action="store_true", help="exit 1 on WARN as well as FAIL")
+    parser.add_argument("--skip-probes", action="store_true",
+                        help="skip subprocess probes (including plugin list) for a config/cache-only pass")
+    args = parser.parse_args(argv)
+
+    doctor = Doctor(skip_probes=args.skip_probes)
+    doctor.check_shared()
+    doctor.check_cf()
+    doctor.check_clf()
+    return doctor.report(strict=args.strict)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(2)

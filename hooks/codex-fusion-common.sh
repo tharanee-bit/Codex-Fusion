@@ -8,8 +8,15 @@ cf_init_common() {
   # predictable shared dir and read/poison our baselines, so we also refuse a dir we do not own.
   STATE_DIR="${TMPDIR:-/tmp}/codex-fusion-state-$(id -u 2>/dev/null || echo 0)"
   CODEX_TIMEOUT="${CODEX_FUSION_TIMEOUT:-180}"
-  CODEX_MODEL="${CODEX_FUSION_MODEL:-gpt-5.5}"
+  CODEX_MODEL="${CODEX_FUSION_MODEL:-gpt-5.6-sol}"
   CODEX_REASONING="${CODEX_FUSION_EFFORT:-xhigh}"
+  CODEX_HOOK_BUDGET="$(cf_positive_int "${CODEX_FUSION_BUDGET:-250}" 250)"
+  CF_KILL_GRACE_SECONDS=5
+  CF_POSTPROCESS_RESERVE_SECONDS=10
+  CF_FALLBACK_MIN_SECONDS=5
+  _cf_started_at="$(date +%s 2>/dev/null)"
+  case "$_cf_started_at" in ''|*[!0-9]*) _cf_started_at=0;; esac
+  CF_DEADLINE_EPOCH=$((_cf_started_at + CODEX_HOOK_BUDGET))
   CODEX_MAX_AGENTS="$(cf_positive_int "${CODEX_FUSION_MAX_AGENTS:-4}" 4)"
   CF_MAX_UNTRACKED_BYTES="$(cf_positive_int "${CODEX_FUSION_MAX_FILE_BYTES:-204800}" 204800)"
   # Paths matched (lowercased, basename and full relative path) against these globs are excluded
@@ -53,6 +60,28 @@ cf_positive_int() {
     0) printf '%s' "$2";;
     *) printf '%s' "$1";;
   esac
+}
+
+cf_remaining_seconds() {
+  _cr_now="$(date +%s 2>/dev/null)"
+  case "$_cr_now" in ''|*[!0-9]*) return 1;; esac
+  _cr_remaining=$((CF_DEADLINE_EPOCH - _cr_now))
+  [ "$_cr_remaining" -gt 0 ] || return 1
+  printf '%s' "$_cr_remaining"
+}
+
+cf_call_timeout() {
+  _ct_remaining="$(cf_remaining_seconds)" || return 1
+  # Keep the hard-kill grace and bounded result processing inside the whole-hook deadline.
+  _ct_usable=$((_ct_remaining - CF_KILL_GRACE_SECONDS - CF_POSTPROCESS_RESERVE_SECONDS))
+  [ "$_ct_usable" -gt 0 ] || return 1
+  _ct_per_call="$(cf_positive_int "$CODEX_TIMEOUT" 180)"
+  [ "$_ct_per_call" -lt "$_ct_usable" ] && printf '%s' "$_ct_per_call" || printf '%s' "$_ct_usable"
+}
+
+cf_read_bounded_file() {
+  [ -f "$1" ] || return 1
+  head -c "$(cf_positive_int "$2" 100000)" -- "$1" 2>/dev/null
 }
 
 cf_subagent_mode() {
@@ -305,20 +334,26 @@ cf_run_codex_to_file() {
 
   _model_args=()
   [ -n "$CODEX_MODEL" ] && _model_args=(-m "$CODEX_MODEL")
-  cf_dbg "running codex role=$_role model=${CODEX_MODEL:-default} effort=$CODEX_REASONING timeout=$CODEX_TIMEOUT cwd=$_cwd"
+  _call_timeout="$(cf_call_timeout)" || { cf_dbg "role=$_role whole-hook budget exhausted before primary"; return 124; }
+  cf_dbg "running codex role=$_role model=${CODEX_MODEL:-default} effort=$CODEX_REASONING timeout=$_call_timeout budget=$CODEX_HOOK_BUDGET cwd=$_cwd"
   CODEX_FUSION_AGENT_ROLE="$_role" CLAUDE_FUSION_ACTIVE=1 CODEX_FUSION_ACTIVE=1 \
-    timeout "$CODEX_TIMEOUT" "$CODEX_BIN" "${_model_args[@]}" -c model_reasoning_effort="$CODEX_REASONING" \
+    timeout -k "$CF_KILL_GRACE_SECONDS" "$_call_timeout" "$CODEX_BIN" "${_model_args[@]}" -c model_reasoning_effort="$CODEX_REASONING" \
     --ask-for-approval never exec \
     -C "$_cwd" --sandbox read-only --color never --skip-git-repo-check \
     -o "$_out" "$_prompt" </dev/null >/dev/null 2>&1
   _rc=$?
 
   if [ "$_rc" -ne 0 ] && [ "$_rc" -ne 124 ] && [ "${#_model_args[@]}" -gt 0 ]; then
+    _fallback_timeout="$(cf_call_timeout)" || { cf_dbg "role=$_role whole-hook budget exhausted; skipping fallback"; return "$_rc"; }
+    if [ "$_fallback_timeout" -lt "$CF_FALLBACK_MIN_SECONDS" ]; then
+      cf_dbg "role=$_role only ${_fallback_timeout}s remain; skipping fallback"
+      return "$_rc"
+    fi
     cf_dbg "role=$_role model $CODEX_MODEL failed rc=$_rc; retrying with codex default model"
     _model_args=()
     : >"$_out" 2>/dev/null || return 1
     CODEX_FUSION_AGENT_ROLE="$_role" CLAUDE_FUSION_ACTIVE=1 CODEX_FUSION_ACTIVE=1 \
-      timeout "$CODEX_TIMEOUT" "$CODEX_BIN" -c model_reasoning_effort="$CODEX_REASONING" \
+      timeout -k "$CF_KILL_GRACE_SECONDS" "$_fallback_timeout" "$CODEX_BIN" -c model_reasoning_effort="$CODEX_REASONING" \
       --ask-for-approval never exec \
       -C "$_cwd" --sandbox read-only --color never --skip-git-repo-check \
       -o "$_out" "$_prompt" </dev/null >/dev/null 2>&1

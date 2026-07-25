@@ -149,7 +149,7 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | `[no-codex]` in your prompt | — | Skips Codex entirely for that prompt. |
 | `[subagents]` or `[codex-subagents]` in your prompt | — | Forces bounded sub-agent fanout for that prompt and its Stop review. |
 | `[no-subagents]` in your prompt | — | Keeps that prompt and its Stop review on the single-Codex path. |
-| `CODEX_FUSION_MODEL` | `gpt-5.5` | Codex model to use. Defaults to the strongest available model. |
+| `CODEX_FUSION_MODEL` | `gpt-5.6-sol` | Codex model to use. Defaults to the strongest available model. |
 | `CODEX_FUSION_EFFORT` | `xhigh` | Codex reasoning effort (`low` / `medium` / `high` / `xhigh`). Defaults to extra-high. |
 | `CODEX_FUSION_SUBAGENTS` | `auto` | Sub-agent policy: `auto`, `off`, or `always`. Prompt markers still select per-turn behavior. |
 | `CODEX_FUSION_SUBAGENT_VERIFY` | `auto` | Adversarial verification of Claude Code subagents: `auto`, `off`, or `always`. `off` disables the `SubagentStop` Codex call entirely. |
@@ -157,6 +157,7 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | `CODEX_FUSION_SUBAGENT_BLOCK_LIMIT` | `2` | Maximum times one subagent can be blocked by verification. At the cap, findings are surfaced as a `systemMessage` instead. |
 | `CODEX_FUSION_MAX_AGENTS` | `4` | Hard cap for hook-launched Codex agents and any bounded internal delegation contract. |
 | `CODEX_FUSION_TIMEOUT` | `180` | Per-agent timeout in seconds. The Claude hook registration timeout remains 270s. |
+| `CODEX_FUSION_BUDGET` | `250` | Whole-hook wall-clock budget in seconds. Every primary/fallback attempt is capped by the shared remaining budget. Keep this below the 270s Claude hook registration. |
 | `CODEX_FUSION_STOP_RETRY_LIMIT` | `2` | Number of transient failed Stop review / subagent verification attempts for unchanged input before skipping. |
 | `CODEX_FUSION_NOTIFY` | `1` | Set to `0` to suppress human-facing success `systemMessage` notices. Context injection, blocking review reasons, and the non-git-repo warning still work. |
 | `CODEX_FUSION_EXCLUDE` | — | Extra space-separated globs to exclude from every review surface, on top of the built-in sensitive-path denylist (globs containing spaces are unsupported). |
@@ -165,14 +166,16 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 
 > **Strongest model, extra-high effort.** Codex Fusion runs on the best Codex model at `xhigh`
 > (extra-high) reasoning effort by default, so the second opinion is as strong as possible. The model
-> is pinned in one constant at the top of each hook (`CODEX_MODEL`) and overridable via
+> is pinned in the shared hook helper (`CODEX_MODEL`) and overridable via
 > `CODEX_FUSION_MODEL` — bump it when a newer top model ships. If the pinned model isn't available to
 > your account, the hook automatically retries once with Codex's own default model so you still get an
 > analysis.
 >
 > This costs latency: most prompts now wait for Codex before Claude responds. Fanout runs agents in
-> parallel, but it can still multiply Codex usage. The per-agent timeout is 180s (hook registration
-> timeout 270s), leaving room for parallel aggregation. Broader firing also means more prompt and diff
+> parallel, but it can still multiply Codex usage. The per-agent timeout is 180s and all workers share
+> one 250s whole-hook deadline, including a 5s hard-kill grace and reserved result-processing time,
+> below the 270s registration timeout.
+> Broader firing also means more prompt and diff
 > text is sent through your logged-in Codex CLI. To trade quality for speed, set
 > `CODEX_FUSION_SUBAGENTS=off`, set `CODEX_FUSION_EFFORT=high` (or `medium` / `low`), or use
 > `[no-codex]` / `[no-subagents]` for a given prompt.
@@ -279,8 +282,31 @@ echo '{"cwd":"'"$PWD"'","session_id":"t1","stop_hook_active":false,"agent_id":"a
 The repo's own test suite runs without Codex installed (it uses a fake `codex` shim):
 
 ```bash
-python3 -m unittest tests.test_hooks
+python3 -m unittest tests.test_hooks tests.test_doctor
 ```
+
+## Health check
+
+```bash
+./bin/harness-doctor              # full check; add --strict to fail on warnings, --skip-probes for a fast pass
+```
+
+A read-only doctor for the whole harness. For Claude Fusion it queries
+`codex plugin list --marketplace claude-fusion --json`, discovers the installed version dynamically,
+and validates enabled state, the versioned plugin cache against its marketplace payload, all three
+`UserPromptSubmit` / `SubagentStop` / `Stop` registrations, scripts and executable bits, the skill,
+read-only flags, and plugin-prefixed trust keys. `--skip-probes` (or a failed CLI query) falls back to
+config/cache inspection; legacy standalone hooks are checked only when plugin mode is absent. An
+empty legacy `hooks.json` alone is inactive, while any orphaned legacy script is reported as a partial
+legacy installation. The Codex Fusion side checks all three of its own `UserPromptSubmit` /
+`SubagentStop` / `Stop` 270s registrations against the 250s whole-hook budget, plus installed-file
+parity, syntax, binaries, flags, and state hygiene.
+It never writes anything.
+Exit 0 = healthy, 1 = at least one FAIL.
+
+The most valuable time to run it: after updating Claude Code / Codex, after editing either repo,
+or whenever the harness feels quiet — most failure modes here are silent by design (the hooks
+guarantee they never block), so this is the tool that makes them visible.
 
 ## Uninstall
 
@@ -300,9 +326,11 @@ hooks/codex-fusion-userprompt.sh     # UserPromptSubmit hook (pre-edit analysis)
 hooks/codex-fusion-stop.sh           # Stop hook (post-diff review)
 hooks/codex-fusion-subagent-stop.sh  # SubagentStop hook (adversarial subagent verification)
 skills/codex-fusion-auto/SKILL.md    # how Claude synthesizes Claude + Codex
+bin/harness-doctor                   # read-only health check for both Fusion directions
 settings.snippet.json                # hooks block to merge (manual install)
 install.sh / uninstall.sh            # idempotent installer / remover
 tests/test_hooks.py                  # end-to-end hook tests against a fake codex CLI
+tests/test_doctor.py                 # harness-doctor tests
 ```
 
 ## License

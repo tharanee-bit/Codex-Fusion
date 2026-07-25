@@ -215,7 +215,8 @@ run_single_review() {
   cf_run_codex_to_file "$LASTMSG" "$CWD" "$_prompt" "single-review"
   _rc=$?
   [ "$_rc" -eq 0 ] || { cf_dbg "codex single review rc=$_rc"; return 1; }
-  REVIEW="$(cat "$LASTMSG" 2>/dev/null)"
+  cf_remaining_seconds >/dev/null || { cf_dbg "whole-hook budget exhausted before single review processing"; return 1; }
+  REVIEW="$(cf_read_bounded_file "$LASTMSG" 100000)"
   [ -n "$REVIEW" ] || { cf_dbg "empty single review"; return 1; }
   return 0
 }
@@ -253,6 +254,7 @@ run_fanout_review() {
   for _pid in "${PIDS[@]}"; do
     wait "$_pid"
   done
+  cf_remaining_seconds >/dev/null || { cf_dbg "whole-hook budget exhausted before fanout review processing"; return 2; }
 
   REVIEW=""
   FAILED_ROLES=""
@@ -262,7 +264,7 @@ run_fanout_review() {
   _i=0
   for _role in "${SELECTED_ROLES[@]}"; do
     _rc="$(cat "${STATUSFILES[$_i]}" 2>/dev/null)"
-    _content="$(cat "${OUTFILES[$_i]}" 2>/dev/null)"
+    _content="$(cf_read_bounded_file "${OUTFILES[$_i]}" 30000)"
     if [ "$_rc" = "0" ] && [ -n "$_content" ]; then
       SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
       _verdict="$(cf_first_nonempty_line "$_content")"
@@ -300,6 +302,7 @@ Failed agents:$FAILED_ROLES
 Codex Fusion used bounded read-only post-diff review fanout (spawned $REVIEW_FANOUT_SPAWNED review sub-agents; all $REVIEW_FANOUT_SUCCEEDED passed)."
   fi
   FANOUT_REVIEW_USED=1
+  cf_remaining_seconds >/dev/null || { cf_dbg "whole-hook budget exhausted after fanout review aggregation"; return 2; }
   return 0
 }
 
@@ -324,6 +327,8 @@ else
   fi
 fi
 
+cf_remaining_seconds >/dev/null || { record_review_failure; cf_dbg "whole-hook budget exhausted before verdict processing"; exit 0; }
+
 VERDICT_LINE="$(cf_first_nonempty_line "$REVIEW")"
 if ! printf '%s' "$VERDICT_LINE" | grep -qiE 'CODEX_REVIEW_VERDICT:[[:space:]]*ISSUES_FOUND'; then
   store_reviewed
@@ -338,6 +343,7 @@ PY
   exit 0
 fi
 
+cf_remaining_seconds >/dev/null || { record_review_failure; cf_dbg "whole-hook budget exhausted before block emission"; exit 0; }
 BLOCK_JSON="$(emit_block "$REVIEW")"
 EMIT_RC=$?
 [ "$EMIT_RC" -eq 0 ] && [ -n "$BLOCK_JSON" ] || { record_review_failure; cf_dbg "block json emit failed"; exit 0; }

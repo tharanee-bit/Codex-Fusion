@@ -54,10 +54,13 @@ class HookTestCase(unittest.TestCase):
                 #!/usr/bin/env python3
                 import json
                 import os
+                import signal
                 import sys
                 import time
 
                 role = os.environ.get("CODEX_FUSION_AGENT_ROLE", "")
+                if os.environ.get("FAKE_CODEX_IGNORE_TERM") == "1":
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
                 has_model = "-m" in sys.argv or "--model" in sys.argv
                 out = None
                 for i, arg in enumerate(sys.argv):
@@ -210,6 +213,20 @@ class HookTestCase(unittest.TestCase):
         argv = self.read_log()[0]["argv"]
         for token in ("--sandbox", "read-only", "--ask-for-approval", "never", "exec"):
             self.assertIn(token, argv)
+        self.assertEqual(argv[argv.index("-m") + 1], "gpt-5.6-sol")
+        self.assertIn("model_reasoning_effort=xhigh", argv)
+
+    def test_model_and_effort_overrides_are_preserved(self):
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "what does this function do?", "cwd": str(self.repo), "session_id": "override"},
+            CODEX_FUSION_MODEL="custom-model",
+            CODEX_FUSION_EFFORT="high",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        argv = self.read_log()[0]["argv"]
+        self.assertEqual(argv[argv.index("-m") + 1], "custom-model")
+        self.assertIn("model_reasoning_effort=high", argv)
 
     def test_auto_fanout_for_high_risk_prompt(self):
         prompt = "Implement the auth database migration plan.\nFix the race condition.\nAdd tests.\nReview security."
@@ -315,6 +332,62 @@ class HookTestCase(unittest.TestCase):
         for entry in calls:
             for token in ("--sandbox", "read-only", "--ask-for-approval", "never", "exec"):
                 self.assertIn(token, entry["argv"], "read-only contract must hold on the fallback attempt too")
+
+    def test_low_remaining_budget_skips_model_fallback(self):
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "what does this function do?", "cwd": str(self.repo), "session_id": "lowbudget"},
+            FAKE_CODEX_FAIL_MODEL="1",
+            CODEX_FUSION_BUDGET="4",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+        self.assertLessEqual(len(self.read_log()), 1, "an insufficient remainder must not start the fallback")
+
+    def test_single_call_is_capped_by_whole_hook_budget(self):
+        start = time.monotonic()
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "what does this function do?", "cwd": str(self.repo), "session_id": "budgetsingle"},
+            FAKE_CODEX_SLEEP="5",
+            CODEX_FUSION_TIMEOUT="10",
+            CODEX_FUSION_BUDGET="2",
+        )
+        elapsed = time.monotonic() - start
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+        self.assertLess(elapsed, 3.5)
+        self.assertLessEqual(len(self.read_log()), 1)
+
+    def test_term_ignoring_child_is_killed_after_grace(self):
+        start = time.monotonic()
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "what does this function do?", "cwd": str(self.repo), "session_id": "hardkill"},
+            FAKE_CODEX_SLEEP="30",
+            FAKE_CODEX_IGNORE_TERM="1",
+            CODEX_FUSION_TIMEOUT="10",
+            CODEX_FUSION_BUDGET="16",
+        )
+        elapsed = time.monotonic() - start
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+        self.assertLess(elapsed, 8.0, "GNU timeout -k grace must hard-kill a TERM-ignoring child")
+
+    def test_fanout_workers_share_the_whole_hook_deadline(self):
+        start = time.monotonic()
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": "tiny request [subagents]", "cwd": str(self.repo), "session_id": "budgetfanout"},
+            FAKE_CODEX_SLEEP="5",
+            CODEX_FUSION_TIMEOUT="10",
+            CODEX_FUSION_BUDGET="2",
+        )
+        elapsed = time.monotonic() - start
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+        self.assertLess(elapsed, 3.5)
+        self.assertLessEqual(len(self.read_log()), 3)
 
     def test_stop_fanout_pass_stores_reviewed_hash(self):
         self.baseline("pass")

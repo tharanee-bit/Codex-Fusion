@@ -184,7 +184,8 @@ run_single() {
   cf_run_codex_to_file "$LASTMSG" "$CWD" "$_prompt" "single"
   _rc=$?
   [ "$_rc" -eq 0 ] || { cf_dbg "codex single rc=$_rc -> skip"; return 1; }
-  _analysis="$(cat "$LASTMSG" 2>/dev/null)"
+  cf_remaining_seconds >/dev/null || { cf_dbg "whole-hook budget exhausted before single result processing"; return 1; }
+  _analysis="$(cf_read_bounded_file "$LASTMSG" 100000)"
   [ -n "$_analysis" ] || { cf_dbg "empty single analysis -> skip"; return 1; }
   ANALYSIS="$_analysis"
   FANOUT_USED=0
@@ -226,6 +227,7 @@ run_fanout() {
   for _pid in "${PIDS[@]}"; do
     wait "$_pid"
   done
+  cf_remaining_seconds >/dev/null || { cf_dbg "whole-hook budget exhausted before fanout result processing"; return 2; }
 
   _success=0
   _failed=""
@@ -233,7 +235,7 @@ run_fanout() {
   _i=0
   for _role in "${SELECTED_ROLES[@]}"; do
     _rc="$(cat "${STATUSFILES[$_i]}" 2>/dev/null)"
-    _content="$(cat "${OUTFILES[$_i]}" 2>/dev/null)"
+    _content="$(cf_read_bounded_file "${OUTFILES[$_i]}" 30000)"
     if [ "$_rc" = "0" ] && [ -n "$_content" ]; then
       _success=$((_success + 1))
       _body="${_body}
@@ -258,6 +260,7 @@ Failed agents:$_failed
   ANALYSIS="Codex Fusion used bounded read-only sub-agent fanout (spawned $FANOUT_SPAWNED sub-agents; $FANOUT_SUCCEEDED/$FANOUT_SPAWNED succeeded).
 $_body"
   FANOUT_USED=1
+  cf_remaining_seconds >/dev/null || { cf_dbg "whole-hook budget exhausted after fanout aggregation"; return 2; }
   return 0
 }
 
@@ -274,6 +277,8 @@ else
   cf_dbg "single selected pref=$SUBAGENT_PREF max=$CODEX_MAX_AGENTS score=$(cf_userprompt_auto_score "$PROMPT" "$GITSTATUS")"
   run_single || finish_skip
 fi
+
+cf_remaining_seconds >/dev/null || finish_skip
 
 if [ "$FANOUT_USED" = "1" ]; then
   PREAMBLE="AUTOMATIC CODEX FUSION CONTEXT:
@@ -301,6 +306,7 @@ fi
 
 # Shell-side cap BEFORE the env handoff: a single env string over ~128KiB fails execve (E2BIG) and
 # the python emitter (with its own finer truncation) would never run at all.
+cf_remaining_seconds >/dev/null || finish_skip
 CODEX_ANALYSIS="$(cf_truncate_bytes "$ANALYSIS" 100000 "codex analysis")" PREAMBLE="$PREAMBLE" MAX_CHARS="$MAX_CHARS" SYSTEM_MESSAGE="$SYSTEM_MESSAGE" "$PY" <<'PY'
 import os, json
 a = os.environ.get("CODEX_ANALYSIS", "")
