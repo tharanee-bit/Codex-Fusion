@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -909,6 +910,55 @@ class HookTestCase(unittest.TestCase):
         payload = json.loads(second.stdout)
         self.assertNotIn("decision", payload)
         self.assertIn("block limit (1) was reached", payload["systemMessage"])
+        self.assertIn(
+            "unsupported claim caught by subagent-verify",
+            payload["systemMessage"],
+            "the cap notice must carry the actual findings, not just a generic line",
+        )
+
+    def test_block_cap_findings_survive_notify_zero(self):
+        """CODEX_FUSION_NOTIFY=0 suppresses success notices, never unresolved findings."""
+        self.baseline("subcapquiet", prompt="baseline")
+        self.modify_repo()
+        extra = {
+            "FAKE_CODEX_ISSUE_ROLES": "subagent-verify",
+            "CODEX_FUSION_SUBAGENT_BLOCK_LIMIT": "1",
+            "CODEX_FUSION_NOTIFY": "0",
+        }
+        first = self.run_hook(SUBAGENT_STOP_HOOK, self.subagent_payload("subcapquiet", "S" * 400), **extra)
+        self.assertEqual(json.loads(first.stdout)["decision"], "block")
+
+        capped = self.run_hook(
+            SUBAGENT_STOP_HOOK, self.subagent_payload("subcapquiet", "S" * 400 + " again"), **extra
+        )
+        self.assertEqual(capped.returncode, 0, capped.stderr)
+        self.assertNotEqual(capped.stdout, "", "cap-hit findings must not be silently dropped under NOTIFY=0")
+        payload = json.loads(capped.stdout)
+        self.assertNotIn("decision", payload)
+        self.assertIn("unsupported claim caught by subagent-verify", payload["systemMessage"])
+
+    def test_unusable_state_dir_surfaces_findings_without_blocking(self):
+        """Without persistable state the block cap cannot be enforced, so never block."""
+        self.baseline("subnostate", prompt="baseline")
+        self.modify_repo()
+        state_path = self.state_dir()
+        shutil.rmtree(state_path)
+        state_path.write_text("not a directory", encoding="utf-8")
+
+        res = self.run_hook(
+            SUBAGENT_STOP_HOOK,
+            self.subagent_payload("subnostate", "T" * 400),
+            FAKE_CODEX_ISSUE_ROLES="subagent-verify",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertNotIn(
+            "decision",
+            payload,
+            "an unenforceable block cap must fail open toward not blocking, or it can loop forever",
+        )
+        self.assertIn("state directory is unusable", payload["systemMessage"])
+        self.assertIn("unsupported claim caught by subagent-verify", payload["systemMessage"])
 
     def test_forced_fanout_verification(self):
         self.baseline("subfan", prompt="baseline [subagents]")

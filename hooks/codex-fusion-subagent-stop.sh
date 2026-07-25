@@ -477,14 +477,34 @@ else:
 PY
 }
 
+emit_findings_notice() {
+  # $1 = verification body, $2 = why we are not blocking. Deliberately NOT gated by
+  # cf_notify_enabled: CODEX_FUSION_NOTIFY=0 suppresses *success* notices, and unresolved
+  # verification findings are the opposite of a success notice. The body is included because a
+  # generic "we found something" line the user cannot act on is barely better than dropping it.
+  emit_json "Codex Fusion: the $AGENT_TYPE subagent has unresolved Codex verification findings, but $2. Findings follow.
+
+$1" notice
+}
+
 deliver_block() {
-  # $1 = verification body. Blocking makes the subagent continue, so it is bounded per agent. At the
-  # cap the findings are surfaced to the user instead of being silently dropped.
+  # $1 = verification body. Blocking makes the subagent continue, so it is bounded per agent. Every
+  # path that declines to block still surfaces the findings.
+  #
+  # The cap is only enforceable when the counter can be persisted. With an unusable state dir
+  # blocks_used always reads 0 and record_block silently no-ops, so blocking here could repeat
+  # without bound — the Stop hook fails safe in that case only because it requires a baseline file,
+  # which this hook deliberately does not. Fail open toward not blocking instead.
+  if ! cf_ensure_state_dir; then
+    cf_dbg "state dir unusable -> surfacing findings without blocking"
+    emit_findings_notice "$1" "the Codex Fusion state directory is unusable, so the per-subagent block limit cannot be enforced"
+    return 0
+  fi
   if [ "$(blocks_used)" -ge "$(block_limit)" ]; then
     store_verified
     clear_verify_failure
     rm -f "$FINDING_FILE" 2>/dev/null
-    cf_notify_enabled && emit_json "Codex Fusion: $AGENT_TYPE subagent still has unresolved Codex verification findings, but the per-subagent block limit ($(block_limit)) was reached; not blocking again." notice
+    emit_findings_notice "$1" "the per-subagent block limit ($(block_limit)) was reached; not blocking again"
     cf_dbg "block limit reached for agent=$AGENT_ID"
     return 0
   fi
