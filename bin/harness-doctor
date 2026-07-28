@@ -368,7 +368,7 @@ class Doctor:
         self.codex_bin = self.check_binary("cf", "codex")
 
         model = os.environ.get("CODEX_FUSION_MODEL", "gpt-5.6-sol")
-        effort = os.environ.get("CODEX_FUSION_EFFORT", "xhigh")
+        effort = os.environ.get("CODEX_FUSION_EFFORT", "high")
         if os.environ.get("CODEX_FUSION_EFFORT") and effort not in CODEX_EFFORTS:
             self.add("WARN", "cf.config", f"CODEX_FUSION_EFFORT={effort!r} is not a known codex effort")
         else:

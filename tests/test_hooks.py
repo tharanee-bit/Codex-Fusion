@@ -215,19 +215,19 @@ class HookTestCase(unittest.TestCase):
         for token in ("--sandbox", "read-only", "--ask-for-approval", "never", "exec"):
             self.assertIn(token, argv)
         self.assertEqual(argv[argv.index("-m") + 1], "gpt-5.6-sol")
-        self.assertIn("model_reasoning_effort=xhigh", argv)
+        self.assertIn("model_reasoning_effort=high", argv)
 
     def test_model_and_effort_overrides_are_preserved(self):
         res = self.run_hook(
             USERPROMPT_HOOK,
             {"prompt": "what does this function do?", "cwd": str(self.repo), "session_id": "override"},
             CODEX_FUSION_MODEL="custom-model",
-            CODEX_FUSION_EFFORT="high",
+            CODEX_FUSION_EFFORT="xhigh",
         )
         self.assertEqual(res.returncode, 0, res.stderr)
         argv = self.read_log()[0]["argv"]
         self.assertEqual(argv[argv.index("-m") + 1], "custom-model")
-        self.assertIn("model_reasoning_effort=high", argv)
+        self.assertIn("model_reasoning_effort=xhigh", argv)
 
     def test_auto_fanout_for_high_risk_prompt(self):
         prompt = "Implement the auth database migration plan.\nFix the race condition.\nAdd tests.\nReview security."
