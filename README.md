@@ -157,7 +157,7 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | `[subagents]` or `[codex-subagents]` in your prompt | — | Forces bounded sub-agent fanout for that prompt and its Stop review. |
 | `[no-subagents]` in your prompt | — | Keeps that prompt and its Stop review on the single-Codex path. |
 | `CODEX_FUSION_MODEL` | `gpt-5.6-sol` | Codex model to use. Defaults to the strongest available model. |
-| `CODEX_FUSION_EFFORT` | `xhigh` | Codex reasoning effort (`low` / `medium` / `high` / `xhigh`). Defaults to extra-high. |
+| `CODEX_FUSION_EFFORT` | `high` | Codex reasoning effort (`low` / `medium` / `high` / `xhigh`). Defaults to high. |
 | `CODEX_FUSION_SUBAGENTS` | `auto` | Sub-agent policy: `auto`, `off`, or `always`. Prompt markers still select per-turn behavior. |
 | `CODEX_FUSION_SUBAGENT_VERIFY` | `auto` | Adversarial verification of Claude Code subagents: `auto`, `off`, or `always`. `off` disables the `SubagentStop` Codex call entirely. |
 | `CODEX_FUSION_SUBAGENT_MIN_CHARS` | `200` | In `auto` mode, a subagent whose tree is unchanged is verified only when its report is at least this many bytes. A subagent that touched the tree is always verified. |
@@ -171,8 +171,8 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | `CODEX_FUSION_MAX_FILE_BYTES` | `204800` | Per-file size cap for untracked files embedded in the review surface; larger files appear as an exclusion marker only. |
 | `CODEX_FUSION_DEBUG=1` | off | Logs gate decisions to `${TMPDIR:-/tmp}/codex-fusion-state-<uid>/debug.log`. |
 
-> **Strongest model, extra-high effort.** Codex Fusion runs on the best Codex model at `xhigh`
-> (extra-high) reasoning effort by default, so the second opinion is as strong as possible. The model
+> **Strongest model, high effort.** Codex Fusion runs on the best Codex model at `high`
+> reasoning effort by default, balancing a strong second opinion with latency and usage. The model
 > is pinned in the shared hook helper (`CODEX_MODEL`) and overridable via
 > `CODEX_FUSION_MODEL` — bump it when a newer top model ships. If the pinned model isn't available to
 > your account, the hook automatically retries once with Codex's own default model so you still get an
@@ -183,9 +183,10 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 > one 250s whole-hook deadline, including a 5s hard-kill grace and reserved result-processing time,
 > below the 270s registration timeout.
 > Broader firing also means more prompt and diff
-> text is sent through your logged-in Codex CLI. To trade quality for speed, set
-> `CODEX_FUSION_SUBAGENTS=off`, set `CODEX_FUSION_EFFORT=high` (or `medium` / `low`), or use
-> `[no-codex]` / `[no-subagents]` for a given prompt.
+> text is sent through your logged-in Codex CLI. Raise reasoning effort with
+> `CODEX_FUSION_EFFORT=xhigh`. To trade quality for speed, set `CODEX_FUSION_SUBAGENTS=off`, lower
+> `CODEX_FUSION_EFFORT` to `medium` or `low`, or use `[no-codex]` / `[no-subagents]` for a given
+> prompt.
 >
 > **Subagent verification is the most expensive knob.** A `SubagentStop` fires once per subagent, so a
 > turn where Claude fans out to 8 subagents costs up to 8 additional Codex calls, running concurrently
