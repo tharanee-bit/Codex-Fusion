@@ -78,6 +78,18 @@ class HookTestCase(unittest.TestCase):
                 if os.environ.get("FAKE_CODEX_FAIL_MODEL") == "1" and has_model:
                     sys.exit(2)
 
+                # Fail only the FIRST invocation, whatever its argv. Now that the fallback keeps
+                # -m pinned, failing on has_model would fail both attempts and never exercise the
+                # retry path.
+                if os.environ.get("FAKE_CODEX_FAIL_FIRST") == "1":
+                    marker = (log or "") + ".failfirst"
+                    try:
+                        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                        os.close(fd)
+                        sys.exit(2)
+                    except FileExistsError:
+                        pass
+
                 fail_roles = {r for r in os.environ.get("FAKE_CODEX_FAIL_ROLES", "").split(",") if r}
                 if role in fail_roles:
                     sys.exit(7)
@@ -215,7 +227,7 @@ class HookTestCase(unittest.TestCase):
         for token in ("--sandbox", "read-only", "--ask-for-approval", "never", "exec"):
             self.assertIn(token, argv)
         self.assertEqual(argv[argv.index("-m") + 1], "gpt-5.6-sol")
-        self.assertIn("model_reasoning_effort=xhigh", argv)
+        self.assertIn("model_reasoning_effort=medium", argv)
 
     def test_model_and_effort_overrides_are_preserved(self):
         res = self.run_hook(
@@ -320,25 +332,47 @@ class HookTestCase(unittest.TestCase):
         self.assertEqual(nested.stdout, "")
         self.assertEqual(self.read_log(), [])
 
-    def test_model_fallback_retries_without_model_arg(self):
+    def test_model_fallback_retries_same_model_at_relaxed_effort(self):
+        """A degraded retry must not swap the adversarial verifier.
+
+        The fallback previously dropped ``-m`` and re-ran on whatever Codex's default model
+        happened to be, silently substituting a different reviewer mid-review. It must now keep
+        the pinned model and relax only the reasoning effort.
+        """
         res = self.run_hook(
             USERPROMPT_HOOK,
             {"prompt": "what does this function do?", "cwd": str(self.repo), "session_id": "fallback"},
-            FAKE_CODEX_FAIL_MODEL="1",
+            FAKE_CODEX_FAIL_FIRST="1",
         )
         self.assertEqual(res.returncode, 0, res.stderr)
         calls = self.read_log()
         self.assertEqual([entry["role"] for entry in calls], ["single", "single"])
-        self.assertEqual([entry["has_model"] for entry in calls], [True, False])
+        self.assertEqual(
+            [entry["has_model"] for entry in calls],
+            [True, True],
+            "the fallback attempt must still pin -m; dropping it swaps the reviewer",
+        )
         for entry in calls:
+            argv = entry["argv"]
+            self.assertEqual(
+                argv[argv.index("-m") + 1],
+                "gpt-5.6-sol",
+                "both attempts must review with the same model",
+            )
             for token in ("--sandbox", "read-only", "--ask-for-approval", "never", "exec"):
-                self.assertIn(token, entry["argv"], "read-only contract must hold on the fallback attempt too")
+                self.assertIn(token, argv, "read-only contract must hold on the fallback attempt too")
+        self.assertIn("model_reasoning_effort=medium", calls[0]["argv"])
+        self.assertIn(
+            "model_reasoning_effort=low",
+            calls[1]["argv"],
+            "the fallback may relax effort, and only effort",
+        )
 
     def test_low_remaining_budget_skips_model_fallback(self):
         res = self.run_hook(
             USERPROMPT_HOOK,
             {"prompt": "what does this function do?", "cwd": str(self.repo), "session_id": "lowbudget"},
-            FAKE_CODEX_FAIL_MODEL="1",
+            FAKE_CODEX_FAIL_FIRST="1",
             CODEX_FUSION_BUDGET="4",
         )
         self.assertEqual(res.returncode, 0, res.stderr)

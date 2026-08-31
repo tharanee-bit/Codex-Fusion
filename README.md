@@ -157,7 +157,8 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | `[subagents]` or `[codex-subagents]` in your prompt | — | Forces bounded sub-agent fanout for that prompt and its Stop review. |
 | `[no-subagents]` in your prompt | — | Keeps that prompt and its Stop review on the single-Codex path. |
 | `CODEX_FUSION_MODEL` | `gpt-5.6-sol` | Codex model to use. Defaults to the strongest available model. |
-| `CODEX_FUSION_EFFORT` | `xhigh` | Codex reasoning effort (`low` / `medium` / `high` / `xhigh`). Defaults to extra-high. |
+| `CODEX_FUSION_EFFORT` | `medium` | Codex reasoning effort (`low` / `medium` / `high` / `xhigh` / `max`). |
+| `CODEX_FUSION_FALLBACK_EFFORT` | `low` | Reasoning effort for the degraded retry. The retry always keeps the same model. |
 | `CODEX_FUSION_SUBAGENTS` | `auto` | Sub-agent policy: `auto`, `off`, or `always`. Prompt markers still select per-turn behavior. |
 | `CODEX_FUSION_SUBAGENT_VERIFY` | `auto` | Adversarial verification of Claude Code subagents: `auto`, `off`, or `always`. `off` disables the `SubagentStop` Codex call entirely. |
 | `CODEX_FUSION_SUBAGENT_MIN_CHARS` | `200` | In `auto` mode, a subagent whose tree is unchanged is verified only when its report is at least this many bytes. A subagent that touched the tree is always verified. |
@@ -171,12 +172,12 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 | `CODEX_FUSION_MAX_FILE_BYTES` | `204800` | Per-file size cap for untracked files embedded in the review surface; larger files appear as an exclusion marker only. |
 | `CODEX_FUSION_DEBUG=1` | off | Logs gate decisions to `${TMPDIR:-/tmp}/codex-fusion-state-<uid>/debug.log`. |
 
-> **Strongest model, extra-high effort.** Codex Fusion runs on the best Codex model at `xhigh`
-> (extra-high) reasoning effort by default, so the second opinion is as strong as possible. The model
-> is pinned in the shared hook helper (`CODEX_MODEL`) and overridable via
-> `CODEX_FUSION_MODEL` — bump it when a newer top model ships. If the pinned model isn't available to
-> your account, the hook automatically retries once with Codex's own default model so you still get an
-> analysis.
+> **Strongest model, medium effort.** Codex Fusion runs on the best Codex model at `medium`
+> reasoning effort by default. The model is pinned in the shared hook helper (`CODEX_MODEL`) and
+> overridable via `CODEX_FUSION_MODEL` — bump it when a newer top model ships. If the pinned model
+> fails, the hook retries once with the **same** model at `CODEX_FUSION_FALLBACK_EFFORT` (`low`):
+> a degraded retry relaxes effort only, so it can never silently swap in a different adversarial
+> verifier. Raise `CODEX_FUSION_EFFORT` to `xhigh` or `max` for a deeper (slower, costlier) review.
 >
 > This costs latency: most prompts now wait for Codex before Claude responds. Fanout runs agents in
 > parallel, but it can still multiply Codex usage. The per-agent timeout is 180s and all workers share

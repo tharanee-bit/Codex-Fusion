@@ -9,7 +9,11 @@ cf_init_common() {
   STATE_DIR="${TMPDIR:-/tmp}/codex-fusion-state-$(id -u 2>/dev/null || echo 0)"
   CODEX_TIMEOUT="${CODEX_FUSION_TIMEOUT:-180}"
   CODEX_MODEL="${CODEX_FUSION_MODEL:-gpt-5.6-sol}"
-  CODEX_REASONING="${CODEX_FUSION_EFFORT:-xhigh}"
+  CODEX_REASONING="${CODEX_FUSION_EFFORT:-medium}"
+  # The fallback attempt stays on the SAME model and only relaxes effort. Dropping -m would let a
+  # degraded retry silently review with whatever Codex's default model happens to be -- swapping the
+  # adversarial verifier mid-review with nothing in the output saying so.
+  CODEX_FALLBACK_REASONING="${CODEX_FUSION_FALLBACK_EFFORT:-low}"
   CODEX_HOOK_BUDGET="$(cf_positive_int "${CODEX_FUSION_BUDGET:-250}" 250)"
   CF_KILL_GRACE_SECONDS=5
   CF_POSTPROCESS_RESERVE_SECONDS=10
@@ -349,11 +353,10 @@ cf_run_codex_to_file() {
       cf_dbg "role=$_role only ${_fallback_timeout}s remain; skipping fallback"
       return "$_rc"
     fi
-    cf_dbg "role=$_role model $CODEX_MODEL failed rc=$_rc; retrying with codex default model"
-    _model_args=()
+    cf_dbg "role=$_role model $CODEX_MODEL failed rc=$_rc; retrying same model at effort=$CODEX_FALLBACK_REASONING"
     : >"$_out" 2>/dev/null || return 1
     CODEX_FUSION_AGENT_ROLE="$_role" CLAUDE_FUSION_ACTIVE=1 CODEX_FUSION_ACTIVE=1 \
-      timeout -k "$CF_KILL_GRACE_SECONDS" "$_fallback_timeout" "$CODEX_BIN" -c model_reasoning_effort="$CODEX_REASONING" \
+      timeout -k "$CF_KILL_GRACE_SECONDS" "$_fallback_timeout" "$CODEX_BIN" "${_model_args[@]}" -c model_reasoning_effort="$CODEX_FALLBACK_REASONING" \
       --ask-for-approval never exec \
       -C "$_cwd" --sandbox read-only --color never --skip-git-repo-check \
       -o "$_out" "$_prompt" </dev/null >/dev/null 2>&1
