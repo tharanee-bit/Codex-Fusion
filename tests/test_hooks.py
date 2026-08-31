@@ -286,16 +286,42 @@ class HookTestCase(unittest.TestCase):
         self.assertEqual([entry["role"] for entry in self.read_log()], ["single"])
 
     def test_fanout_runs_agents_in_parallel(self):
-        start = time.monotonic()
+        """Assert concurrency directly, not via total wall-clock.
+
+        The old form asserted ``elapsed < 1.2`` for three 0.45s agents. That
+        conflates the property under test (the agents overlap) with everything
+        else in the run -- interpreter startup, git, filesystem work -- so it
+        failed ~2 of 3 full-suite runs under load while the hook was perfectly
+        correct. A flaky assertion that cries wolf is worse than no assertion,
+        because it trains you to ignore red.
+
+        The fake codex records a timestamp as each call STARTS. Serial execution
+        spreads those starts by roughly 2x the per-call sleep; parallel execution
+        clusters them. Comparing the spread against the sleep is self-scaling, so
+        a slow machine makes both sides slower and the assertion still holds.
+        """
+        sleep_seconds = 0.45
         res = self.run_hook(
             USERPROMPT_HOOK,
             {"prompt": "tiny request [subagents]", "cwd": str(self.repo), "session_id": "parallel"},
-            FAKE_CODEX_SLEEP="0.45",
+            FAKE_CODEX_SLEEP=str(sleep_seconds),
         )
-        elapsed = time.monotonic() - start
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertLess(elapsed, 1.2)
-        self.assertCountEqual([entry["role"] for entry in self.read_log()], ["planner", "skeptic", "verifier"])
+
+        calls = self.read_log()
+        self.assertCountEqual(
+            [entry["role"] for entry in calls], ["planner", "skeptic", "verifier"]
+        )
+
+        starts = sorted(entry["time"] for entry in calls)
+        spread = starts[-1] - starts[0]
+        self.assertLess(
+            spread,
+            sleep_seconds,
+            "the three agents did not overlap: their start times span "
+            f"{spread:.3f}s, which is >= the {sleep_seconds}s each one sleeps, so "
+            "they ran serially rather than in parallel",
+        )
 
     def test_prompt_markers_force_and_disable_fanout(self):
         forced = self.run_hook(
