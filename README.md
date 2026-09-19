@@ -185,9 +185,10 @@ Copy `hooks/*.sh` into `~/.claude/hooks/` (and `chmod +x` them), copy
 > one 250s whole-hook deadline, including a 5s hard-kill grace and reserved result-processing time,
 > below the 270s registration timeout.
 > Broader firing also means more prompt and diff
-> text is sent through your logged-in Codex CLI. To trade quality for speed, set
-> `CODEX_FUSION_SUBAGENTS=off`, set `CODEX_FUSION_EFFORT=high` (or `medium` / `low`), or use
-> `[no-codex]` / `[no-subagents]` for a given prompt.
+> text is sent through your logged-in Codex CLI. Raise reasoning effort with
+> `CODEX_FUSION_EFFORT=xhigh`. To trade quality for speed, set `CODEX_FUSION_SUBAGENTS=off`, lower
+> `CODEX_FUSION_EFFORT` to `medium` or `low`, or use `[no-codex]` / `[no-subagents]` for a given
+> prompt.
 >
 > **Subagent verification is the most expensive knob.** A `SubagentStop` fires once per subagent, so a
 > turn where Claude fans out to 8 subagents costs up to 8 additional Codex calls, running concurrently
