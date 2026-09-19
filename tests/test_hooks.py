@@ -226,8 +226,8 @@ class HookTestCase(unittest.TestCase):
         argv = self.read_log()[0]["argv"]
         for token in ("--sandbox", "read-only", "--ask-for-approval", "never", "exec"):
             self.assertIn(token, argv)
-        self.assertEqual(argv[argv.index("-m") + 1], "gpt-5.6-sol")
-        self.assertIn("model_reasoning_effort=medium", argv)
+        self.assertEqual(argv[argv.index("-m") + 1], "gpt-5.6-luna")
+        self.assertIn("model_reasoning_effort=max", argv)
 
     def test_model_and_effort_overrides_are_preserved(self):
         res = self.run_hook(
@@ -382,14 +382,14 @@ class HookTestCase(unittest.TestCase):
             argv = entry["argv"]
             self.assertEqual(
                 argv[argv.index("-m") + 1],
-                "gpt-5.6-sol",
+                "gpt-5.6-luna",
                 "both attempts must review with the same model",
             )
             for token in ("--sandbox", "read-only", "--ask-for-approval", "never", "exec"):
                 self.assertIn(token, argv, "read-only contract must hold on the fallback attempt too")
-        self.assertIn("model_reasoning_effort=medium", calls[0]["argv"])
+        self.assertIn("model_reasoning_effort=max", calls[0]["argv"])
         self.assertIn(
-            "model_reasoning_effort=low",
+            "model_reasoning_effort=xhigh",
             calls[1]["argv"],
             "the fallback may relax effort, and only effort",
         )

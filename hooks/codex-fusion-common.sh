@@ -8,12 +8,12 @@ cf_init_common() {
   # predictable shared dir and read/poison our baselines, so we also refuse a dir we do not own.
   STATE_DIR="${TMPDIR:-/tmp}/codex-fusion-state-$(id -u 2>/dev/null || echo 0)"
   CODEX_TIMEOUT="${CODEX_FUSION_TIMEOUT:-180}"
-  CODEX_MODEL="${CODEX_FUSION_MODEL:-gpt-5.6-sol}"
-  CODEX_REASONING="${CODEX_FUSION_EFFORT:-medium}"
+  CODEX_MODEL="${CODEX_FUSION_MODEL:-gpt-5.6-luna}"
+  CODEX_REASONING="${CODEX_FUSION_EFFORT:-max}"
   # The fallback attempt stays on the SAME model and only relaxes effort. Dropping -m would let a
   # degraded retry silently review with whatever Codex's default model happens to be -- swapping the
   # adversarial verifier mid-review with nothing in the output saying so.
-  CODEX_FALLBACK_REASONING="${CODEX_FUSION_FALLBACK_EFFORT:-low}"
+  CODEX_FALLBACK_REASONING="${CODEX_FUSION_FALLBACK_EFFORT:-xhigh}"
   CODEX_HOOK_BUDGET="$(cf_positive_int "${CODEX_FUSION_BUDGET:-250}" 250)"
   CF_KILL_GRACE_SECONDS=5
   CF_POSTPROCESS_RESERVE_SECONDS=10

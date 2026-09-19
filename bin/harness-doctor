@@ -59,7 +59,7 @@ TRUST_FRAGMENTS = {
 # Mirrors the shell hooks' SAFE_MODE case patterns exactly (a value like "fAlSe" does NOT disable).
 SAFE_MODE_DISABLED = {"0", "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"}
 CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
-CODEX_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 PLUGIN_VERSION_RE = re.compile(r"[0-9A-Za-z]+(?:[._+-][0-9A-Za-z]+)*\Z")
 
 
@@ -367,8 +367,8 @@ class Doctor:
         self.check_syntax("cf", hooks_dir, CF_SCRIPTS)
         self.codex_bin = self.check_binary("cf", "codex")
 
-        model = os.environ.get("CODEX_FUSION_MODEL", "gpt-5.6-sol")
-        effort = os.environ.get("CODEX_FUSION_EFFORT", "xhigh")
+        model = os.environ.get("CODEX_FUSION_MODEL", "gpt-5.6-luna")
+        effort = os.environ.get("CODEX_FUSION_EFFORT", "max")
         if os.environ.get("CODEX_FUSION_EFFORT") and effort not in CODEX_EFFORTS:
             self.add("WARN", "cf.config", f"CODEX_FUSION_EFFORT={effort!r} is not a known codex effort")
         else:
